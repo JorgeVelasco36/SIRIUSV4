@@ -1,0 +1,32 @@
+.chat-interface {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.chat-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  background: white;
+  margin: 1rem;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  .chat-interface {
+    flex-direction: column;
+  }
+  
+  .chat-main {
+    margin: 0.5rem;
+  }
+}
+
+
+

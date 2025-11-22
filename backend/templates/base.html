@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S.I.R.I.U.S V4 - Asistente de Renta Fija</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Modal de Autenticación Supabase -->
+    <div id="auth-modal" class="auth-modal">
+        <div class="auth-modal-content">
+            <div class="auth-modal-header">
+                <h2>Autenticación Supabase</h2>
+                <p class="auth-modal-subtitle">Ingresa tus credenciales para acceder a S.I.R.I.U.S</p>
+            </div>
+            <form id="auth-form" class="auth-form">
+                <div id="auth-error" class="auth-error" style="display: none;"></div>
+                
+                <div class="auth-form-group">
+                    <label for="auth-email">Correo Electrónico:</label>
+                    <input 
+                        type="email" 
+                        id="auth-email" 
+                        class="auth-input" 
+                        placeholder="tu@correo.com"
+                        required
+                        autocomplete="email"
+                    >
+                </div>
+                
+                <div class="auth-form-group">
+                    <label for="auth-password">Contraseña:</label>
+                    <input 
+                        type="password" 
+                        id="auth-password" 
+                        class="auth-input" 
+                        placeholder="Tu contraseña de Supabase"
+                        required
+                        autocomplete="current-password"
+                    >
+                </div>
+                
+                <button type="submit" id="auth-submit" class="auth-submit-btn">
+                    <span id="auth-submit-text">Iniciar Sesión</span>
+                    <span id="auth-submit-loading" class="auth-loading" style="display: none;">
+                        <span class="auth-spinner"></span> Validando...
+                    </span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <div class="app-container" id="app-container" style="display: none;">
+        <header class="header">
+            <div class="header-content">
+                <h1 class="header-title">S.I.R.I.U.S V4</h1>
+                <p class="header-subtitle">Asistente Conversacional de Renta Fija Colombiana</p>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <aside class="filters-panel">
+                <h3>Filtros Rápidos</h3>
+                
+                <div class="filter-group">
+                    <label for="fecha">Fecha:</label>
+                    <input type="date" id="fecha" class="filter-input">
+                </div>
+
+                <div class="filter-group">
+                    <label for="proveedor">Proveedor:</label>
+                    <select id="proveedor" class="filter-input">
+                        <option value="">Todos</option>
+                        <option value="PIP_LATAM">PIP Latam</option>
+                        <option value="PRECIA">Precia</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <label for="isins">ISINs (separados por coma):</label>
+                    <textarea id="isins" class="filter-input" rows="3" placeholder="CO000123456, CO000789012"></textarea>
+                </div>
+
+                <button id="clear-filters" class="clear-filters-btn">Limpiar Filtros</button>
+            </aside>
+
+            <main class="chat-container">
+                <div id="messages" class="messages-container">
+                    <div class="welcome-message">
+                        <h2>Bienvenido a S.I.R.I.U.S V4</h2>
+                        <p>Puedes hacer consultas como:</p>
+                        <ul>
+                            <li>"¿Cuál es el precio limpio del TES CO000123 hoy en Precia?"</li>
+                            <li>"Compara PIP Latam vs Precia para este ISIN."</li>
+                            <li>"Trae valoración de ayer para estos 5 ISINs."</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="input-container">
+                    <textarea id="message-input" class="message-input" rows="2" placeholder="Escribe tu consulta aquí... (Enter para enviar, Shift+Enter para nueva línea)"></textarea>
+                    <button id="send-button" class="send-button">Enviar</button>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
+
+
+

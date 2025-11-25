@@ -47,6 +47,7 @@ class ChatMessage(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     user: Optional[str] = None
     filters: Optional[dict] = None
+    supabase_access_token: Optional[str] = None  # Token JWT de Supabase para consultas directas
 
 
 class ChatResponse(BaseModel):
@@ -67,6 +68,8 @@ class ValuationQuery(BaseModel):
     fecha_fin: Optional[date] = None
     emisor: Optional[str] = None
     tipo_instrumento: Optional[str] = None
+    fecha_vencimiento: Optional[date] = None  # Para búsquedas por fecha de vencimiento
+    cupon: Optional[float] = None  # Tasa facial o cupón para filtrar
 
 
 class IngestRequest(BaseModel):

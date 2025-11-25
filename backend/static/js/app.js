@@ -264,6 +264,9 @@ async function handleSendMessage() {
             messageText += ` (ISINs: ${filters.isins})`;
         }
         
+        // Obtener token de acceso de Supabase si está disponible
+        const supabaseAccessToken = sessionStorage.getItem('supabase_access_token');
+        
         const response = await fetch(`${API_URL}/chat`, {
             method: 'POST',
             headers: {
@@ -271,7 +274,8 @@ async function handleSendMessage() {
             },
             body: JSON.stringify({
                 message: messageText,
-                user: 'web_user'
+                user: 'web_user',
+                supabase_access_token: supabaseAccessToken
             })
         });
         
@@ -357,11 +361,12 @@ function formatData(data) {
         // Crear tabla
         let html = '<div class="valuation-table"><table><thead><tr>';
         
-        // Headers
+        // Headers (excluir campos irrelevantes)
         const firstItem = data[0];
         const keys = Object.keys(firstItem);
+        const excludedKeys = ['id', 'timestamp_ingesta', 'convexidad', 'archivo_origen'];
         keys.forEach(key => {
-            if (key !== 'id' && key !== 'timestamp_ingesta') {
+            if (!excludedKeys.includes(key)) {
                 html += `<th>${formatKey(key)}</th>`;
             }
         });
@@ -371,7 +376,7 @@ function formatData(data) {
         data.forEach(item => {
             html += '<tr>';
             keys.forEach(key => {
-                if (key !== 'id' && key !== 'timestamp_ingesta') {
+                if (!excludedKeys.includes(key)) {
                     const value = item[key];
                     const formatted = formatValue(value);
                     const className = typeof value === 'number' ? 'number' : '';

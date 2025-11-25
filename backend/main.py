@@ -145,7 +145,9 @@ async def chat(
     - "Trae valoración de ayer para estos 5 ISINs."
     """
     try:
-        chat_service = ChatService(db)
+        # Usar el token de acceso de Supabase si está disponible
+        access_token = message.supabase_access_token
+        chat_service = ChatService(db, supabase_access_token=access_token)
         response = chat_service.generate_response(message.message, message.user)
         return ChatResponse(**response)
     except Exception as e:

@@ -75,8 +75,8 @@ class IngestRequest(BaseModel):
     file_path: Optional[str] = None
     supabase_file_name: Optional[str] = None  # Nombre del archivo en Supabase
     fecha_valoracion: Optional[date] = None
-    supabase_email: Optional[str] = None  # Email de Supabase (opcional, usa .env si no se proporciona)
-    supabase_password: Optional[str] = None  # Contraseña de Supabase (opcional, usa .env si no se proporciona)
+    supabase_api_key: Optional[str] = None  # API Key de Supabase (opcional, deprecated)
+    supabase_access_token: Optional[str] = None  # Access token JWT de Supabase (opcional)
 
 
 class IngestResponse(BaseModel):
@@ -89,8 +89,8 @@ class IngestResponse(BaseModel):
 
 class SupabaseAuthRequest(BaseModel):
     """Schema for Supabase authentication request"""
-    email: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=1)
+    email: str = Field(..., min_length=1)  # Correo electrónico
+    password: str = Field(..., min_length=1)  # Contraseña
 
 
 class SupabaseAuthResponse(BaseModel):
@@ -98,4 +98,5 @@ class SupabaseAuthResponse(BaseModel):
     success: bool
     message: str
     tables_status: Optional[dict] = None
+    access_token: Optional[str] = None  # Token JWT para usar en peticiones
 

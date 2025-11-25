@@ -47,7 +47,7 @@ jinja_env = Environment(loader=FileSystemLoader("templates"))
 # Configurar CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,15 +70,28 @@ async def health_check():
 @app.post(f"{settings.api_v1_prefix}/auth/supabase", response_model=SupabaseAuthResponse)
 async def authenticate_supabase(auth: SupabaseAuthRequest):
     """
-    Endpoint para autenticar credenciales de Supabase
+    Endpoint para autenticar con Supabase usando correo y contraseña
     
-    Valida las credenciales proporcionadas y verifica que las tablas existan
+    Valida las credenciales y verifica que las tablas existan
     """
     try:
         from services.supabase_service import SupabaseService
         
-        # Intentar conectar con las credenciales proporcionadas
-        supabase = SupabaseService(email=auth.email, password=auth.password)
+        # Autenticar con correo y contraseña
+        auth_result = SupabaseService.authenticate_with_email_password(
+            email=auth.email,
+            password=auth.password
+        )
+        
+        if not auth_result["success"]:
+            return SupabaseAuthResponse(
+                success=False,
+                message="Error de autenticación. Por favor, verifica tu correo y contraseña.",
+                tables_status=None
+            )
+        
+        # Crear servicio con el access token obtenido
+        supabase = SupabaseService(access_token=auth_result["access_token"])
         
         # Probar la conexión y verificar tablas
         result = supabase.test_connection()
@@ -89,12 +102,13 @@ async def authenticate_supabase(auth: SupabaseAuthRequest):
             return SupabaseAuthResponse(
                 success=True,
                 message="Autenticación exitosa",
-                tables_status=result["tables"]
+                tables_status=result["tables"],
+                access_token=auth_result.get("access_token")  # Devolver el token para que el frontend lo use
             )
         else:
             return SupabaseAuthResponse(
                 success=False,
-                message="Error de autenticación. Por favor, verifica tu correo y contraseña.",
+                message="Error de conexión. Por favor, verifica tu correo y contraseña.",
                 tables_status=None
             )
             
@@ -103,7 +117,7 @@ async def authenticate_supabase(auth: SupabaseAuthRequest):
         error_message = str(e)
         
         # Mensajes de error más amigables
-        if "password authentication failed" in error_message.lower() or "authentication failed" in error_message.lower():
+        if "401" in error_message or "unauthorized" in error_message.lower() or "invalid" in error_message.lower():
             error_message = "Error de autenticación. Por favor, verifica tu correo y contraseña."
         elif "could not connect" in error_message.lower() or "connection" in error_message.lower():
             error_message = "Error de conexión. Verifica tu conexión a internet."
@@ -204,7 +218,7 @@ async def compare_providers(
         raise HTTPException(status_code=500, detail=f"Error comparando proveedores: {str(e)}")
 
 
-@app.get(f"{settings.api_v1_prefix}/valuations/{isin}/alerts")
+@app.get(f"{settings.api_v1_prefix}/valuations/{{isin}}/alerts")
 async def get_alerts(
     isin: str,
     fecha: Optional[date] = None,
@@ -237,11 +251,11 @@ async def ingest_file(
     Endpoint para ingerir archivos desde Supabase o ruta local
     """
     try:
-        # Usar credenciales proporcionadas o las del .env
+        # Usar access token o API Key proporcionada, o la del .env
         ingestion_service = IngestionService(
             db,
-            supabase_email=request.supabase_email,
-            supabase_password=request.supabase_password
+            supabase_api_key=request.supabase_api_key,
+            supabase_access_token=request.supabase_access_token
         )
         
         if request.supabase_file_name:

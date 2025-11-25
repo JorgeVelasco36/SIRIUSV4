@@ -3,11 +3,15 @@
 Script para ingesta automática desde Supabase PostgreSQL
 """
 import sys
+import os
 import argparse
 from datetime import datetime, date
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+# Cambiar al directorio backend para que pydantic_settings encuentre el .env
+backend_dir = Path(__file__).parent.parent / "backend"
+os.chdir(backend_dir)
+sys.path.insert(0, str(backend_dir))
 
 from sqlalchemy.orm import Session
 from database import SessionLocal
@@ -112,9 +116,9 @@ def main():
                         provider,
                         fecha_valoracion
                     )
-                    print(f"✓ {file_name}: {result['records_processed']} registros")
+                    print(f"[OK] {file_name}: {result['records_processed']} registros")
                 except Exception as e:
-                    print(f"✗ Error con {file_name}: {str(e)}")
+                    print(f"[ERROR] Error con {file_name}: {str(e)}")
                     continue
             
         finally:
@@ -122,7 +126,7 @@ def main():
             supabase.close()
             
     except Exception as e:
-        print(f"✗ Error: {str(e)}")
+        print(f"[ERROR] Error: {str(e)}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

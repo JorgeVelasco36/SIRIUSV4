@@ -3,9 +3,14 @@ Script para validar la conexión a Supabase y verificar las tablas BD_PIP y BD_P
 """
 import sys
 import os
+from pathlib import Path
+
+# Cambiar al directorio backend para que pydantic_settings encuentre el .env
+backend_dir = Path(__file__).parent.parent / "backend"
+os.chdir(backend_dir)
 
 # Agregar el directorio backend al path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
+sys.path.insert(0, str(backend_dir))
 
 from services.supabase_service import SupabaseService
 from config import settings
@@ -26,40 +31,43 @@ def main():
     print()
     
     # Verificar configuración
-    if not settings.supabase_db_url:
-        print("❌ ERROR: SUPABASE_DB_URL no está configurado en .env")
+    if not settings.supabase_api_key:
+        print("[ERROR] SUPABASE_API_KEY no esta configurado en .env")
         print()
-        print("Por favor, agrega la siguiente línea a tu archivo .env:")
-        print("SUPABASE_DB_URL=postgresql://postgres:[YOUR_PASSWORD]@db.mwyltxcgjxsrdmgsuysv.supabase.co:5432/postgres")
+        print("Por favor, agrega la siguiente linea a tu archivo .env:")
+        print("SUPABASE_API_KEY=tu_api_key_aqui")
         return 1
     
-    print(f"✓ URL de Supabase configurada")
-    print(f"  Base de datos: {settings.supabase_db_name}")
+    if not settings.supabase_url:
+        print("[ADVERTENCIA] SUPABASE_URL no esta configurado, usando URL por defecto")
+    
+    print(f"[OK] Configuracion de Supabase:")
+    print(f"  URL: {settings.supabase_url or 'https://mwyltxcgjxsrdmgsuysv.supabase.co'}")
     print(f"  Tabla PIP: {settings.supabase_table_pip}")
     print(f"  Tabla Precia: {settings.supabase_table_precia}")
     print()
     
     try:
         # Crear servicio
-        print("Conectando a Supabase...")
+        print("Conectando a Supabase API...")
         supabase = SupabaseService()
         
         # Probar conexión
-        print("Probando conexión...")
+        print("Probando conexion...")
         result = supabase.test_connection()
         
         print()
         if result["success"]:
-            print("✅ CONEXIÓN EXITOSA")
+            print("[OK] CONEXION EXITOSA")
             print()
             print("Estado de las tablas:")
             for table_name, exists in result["tables"].items():
-                status = "✅ Existe" if exists else "❌ No existe"
+                status = "[OK] Existe" if exists else "[ERROR] No existe"
                 print(f"  {table_name}: {status}")
             
             if result["all_tables_exist"]:
                 print()
-                print("✅ Todas las tablas están disponibles")
+                print("[OK] Todas las tablas estan disponibles")
                 
                 # Listar algunos archivos de ejemplo
                 print()
@@ -78,25 +86,25 @@ def main():
                         for f in files_precia[:5]:  # Mostrar solo los primeros 5
                             print(f"    - {f['name']} ({f['record_count']} registros)")
                 except Exception as e:
-                    print(f"  ⚠️  No se pudieron listar archivos: {str(e)}")
+                    print(f"  [ADVERTENCIA] No se pudieron listar archivos: {str(e)}")
             else:
                 print()
-                print("⚠️  ADVERTENCIA: Algunas tablas no existen")
-                print("   Asegúrate de que las tablas BD_PIP y BD_Precia existan en Supabase")
+                print("[ADVERTENCIA] Algunas tablas no existen")
+                print("   Asegurate de que las tablas BD_PIP y BD_Precia existan en Supabase")
             
             supabase.close()
             return 0
         else:
-            print("❌ ERROR DE CONEXIÓN")
+            print("[ERROR] ERROR DE CONEXION")
             print(f"   {result['message']}")
             supabase.close()
             return 1
             
     except ValueError as e:
-        print(f"❌ ERROR DE CONFIGURACIÓN: {str(e)}")
+        print(f"[ERROR] ERROR DE CONFIGURACION: {str(e)}")
         return 1
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
+        print(f"[ERROR] ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
         return 1

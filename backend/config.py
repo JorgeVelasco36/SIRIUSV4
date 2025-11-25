@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     # Si no se especifica, usa SQLite (no requiere instalación)
     database_url: str = "sqlite:///./sirius_v4.db"
     
-    # Supabase PostgreSQL (reemplaza a MongoDB)
-    supabase_db_url: str = ""  # Connection string de Supabase
-    supabase_db_name: str = "postgres"  # Nombre de la base de datos
+    # Supabase (reemplaza a MongoDB)
+    supabase_url: str = ""  # URL del proyecto Supabase (ej: https://xxxxx.supabase.co)
+    supabase_api_key: str = ""  # API Key de Supabase (anon key)
     supabase_table_pip: str = "BD_PIP"  # Tabla para PIP_LATAM
     supabase_table_precia: str = "BD_Precia"  # Tabla para PRECIA
     
@@ -44,11 +44,20 @@ class Settings(BaseSettings):
     
     # API
     api_v1_prefix: str = "/api/v1"
-    cors_origins: List[str] = ["http://localhost:3000", "http://localhost:3001"]
+    cors_origins: str = "http://localhost:3000,http://localhost:3001"
+    
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Convierte cors_origins de string a lista"""
+        if isinstance(self.cors_origins, str):
+            return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        return self.cors_origins if isinstance(self.cors_origins, list) else []
     
     class Config:
         env_file = ".env"
+        env_file_encoding = "utf-8-sig"  # Maneja BOM automáticamente
         case_sensitive = False
+        extra = "ignore"  # Ignora campos extra en el .env
 
 
 settings = Settings()

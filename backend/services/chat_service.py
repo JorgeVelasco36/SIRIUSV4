@@ -208,11 +208,12 @@ class ChatService:
                         "Confirmar que hay valoraciones para la fecha solicitada",
                         "Revisar archivos de ingesta recientes"
                     ]
+                    data = None
                 else:
                     answer = self._format_comparison(comparison)
                     recommendations = self._generate_comparison_recommendations(comparison)
-                
-                data = comparison
+                    # Convertir comparación a lista para mantener consistencia con el schema
+                    data = [comparison] if comparison else None
                 
             elif query.isins or (query.isin and len(extracted.get("isins", [])) > 1):
                 # Múltiples ISINs
@@ -237,7 +238,8 @@ class ChatService:
                 else:
                     answer = self._format_single_response(valuations[0], extracted)
                     recommendations = self._generate_single_recommendations(valuations[0])
-                    data = self._valuation_to_dict(valuations[0])
+                    # Convertir a lista para mantener consistencia con el schema
+                    data = [self._valuation_to_dict(valuations[0])]
             
             # Detectar inconsistencias
             if query.isin:
@@ -257,6 +259,10 @@ class ChatService:
             )
             self.db.add(log_entry)
             self.db.commit()
+            
+            # Asegurar que data sea siempre una lista o None
+            if data is not None and not isinstance(data, list):
+                data = [data]
             
             return {
                 "answer": answer,

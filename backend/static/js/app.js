@@ -10,7 +10,7 @@ let filters = {
 
 // Estado de autenticación
 let isAuthenticated = false;
-let supabaseCredentials = null;
+let supabaseAccessToken = null;
 
 // Inicialización
 document.addEventListener('DOMContentLoaded', () => {
@@ -19,20 +19,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Verificar autenticación al cargar
 function checkAuthentication() {
-    // Verificar si hay credenciales guardadas en sessionStorage
-    const savedCredentials = sessionStorage.getItem('supabase_credentials');
+    // Verificar si hay access token guardado en sessionStorage
+    const savedToken = sessionStorage.getItem('supabase_access_token');
     
-    if (savedCredentials) {
-        try {
-            supabaseCredentials = JSON.parse(savedCredentials);
-            // Verificar que las credenciales sigan siendo válidas
-            validateCredentials(supabaseCredentials.email, supabaseCredentials.password);
-        } catch (e) {
-            // Si hay error, mostrar modal de autenticación
-            showAuthModal();
-        }
+    if (savedToken) {
+        // Usar el token guardado
+        supabaseAccessToken = savedToken;
+        hideAuthModal();
     } else {
-        // No hay credenciales guardadas, mostrar modal
+        // No hay token guardado, mostrar modal
         showAuthModal();
     }
 }
@@ -79,15 +74,17 @@ function initializeAuthListeners() {
         authForm.addEventListener('submit', handleAuthSubmit);
     }
     
-    // Prevenir que Enter en los campos cierre el modal
-    if (authEmail && authPassword) {
+    // Permitir Enter para enviar desde cualquier campo
+    if (authEmail) {
         authEmail.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 e.preventDefault();
-                authPassword.focus();
+                authPassword?.focus();
             }
         });
-        
+    }
+    
+    if (authPassword) {
         authPassword.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 e.preventDefault();
@@ -108,67 +105,69 @@ async function handleAuthSubmit(e) {
     const submitLoading = document.getElementById('auth-submit-loading');
     const errorDiv = document.getElementById('auth-error');
     
-    const email = emailInput.value.trim();
-    const password = passwordInput.value;
-    
-    if (!email || !password) {
-        showAuthError('Por favor, completa todos los campos');
+    if (!emailInput || !emailInput.value.trim()) {
+        showAuthError('Por favor, ingresa tu correo electrónico');
         return;
     }
     
-    // Deshabilitar botón y mostrar loading
-    submitBtn.disabled = true;
-    submitText.style.display = 'none';
-    submitLoading.style.display = 'flex';
-    errorDiv.style.display = 'none';
-    
-    try {
-        await validateCredentials(email, password);
-    } catch (error) {
-        // El error ya se maneja en validateCredentials
-    } finally {
-        // Restaurar botón
-        submitBtn.disabled = false;
-        submitText.style.display = 'inline';
-        submitLoading.style.display = 'none';
+    if (!passwordInput || !passwordInput.value.trim()) {
+        showAuthError('Por favor, ingresa tu contraseña');
+        return;
     }
-}
-
-// Validar credenciales con el backend
-async function validateCredentials(email, password) {
-    const errorDiv = document.getElementById('auth-error');
+    
+    // Mostrar estado de carga
+    if (submitBtn) submitBtn.disabled = true;
+    if (submitText) submitText.style.display = 'none';
+    if (submitLoading) submitLoading.style.display = 'inline-flex';
+    if (errorDiv) errorDiv.style.display = 'none';
     
     try {
+        // Validar credenciales con el backend
         const response = await fetch(`${API_URL}/auth/supabase`, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                email: email,
-                password: password
+                email: emailInput.value.trim(),
+                password: passwordInput.value.trim()
             })
         });
         
+        // Verificar si la respuesta es exitosa
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ message: 'Error de conexión con el servidor' }));
+            showAuthError(errorData.message || `Error ${response.status}: ${response.statusText}`);
+            return;
+        }
+        
         const data = await response.json();
+        console.log('Respuesta de autenticación:', data);
         
         if (data.success) {
-            // Autenticación exitosa
-            isAuthenticated = true;
-            supabaseCredentials = { email, password };
-            
-            // Guardar credenciales en sessionStorage
-            sessionStorage.setItem('supabase_credentials', JSON.stringify(supabaseCredentials));
+            // Guardar access token en sessionStorage
+            if (data.access_token) {
+                sessionStorage.setItem('supabase_access_token', data.access_token);
+                supabaseAccessToken = data.access_token;
+                isAuthenticated = true;
+                console.log('Autenticación exitosa, token guardado');
+            } else {
+                console.warn('Autenticación exitosa pero no se recibió access_token');
+            }
             
             // Ocultar modal y mostrar aplicación
             hideAuthModal();
         } else {
-            // Error de autenticación
             showAuthError(data.message || 'Error de autenticación. Por favor, verifica tu correo y contraseña.');
         }
     } catch (error) {
         console.error('Error en autenticación:', error);
-        showAuthError('Error de conexión. Por favor, verifica tu conexión a internet e intenta nuevamente.');
+        showAuthError('Error de conexión. Por favor, verifica tu conexión a internet.');
+    } finally {
+        // Restaurar estado del botón
+        if (submitBtn) submitBtn.disabled = false;
+        if (submitText) submitText.style.display = 'inline';
+        if (submitLoading) submitLoading.style.display = 'none';
     }
 }
 

@@ -17,9 +17,22 @@ class IngestionService:
     """Servicio para ingerir y normalizar archivos de valoración"""
     
     # Mapeo de columnas comunes por proveedor
+    # Incluye mapeo para columnas de Supabase (en mayúsculas) y archivos Excel/CSV
     COLUMN_MAPPINGS = {
         Provider.PIP_LATAM: {
+            # Columnas de Supabase (mayúsculas)
             "ISIN": "isin",
+            "EMISION": "emisor",
+            "TIPO_ACTIVO": "tipo_instrumento",
+            "PRECIO_LIMPIO": "precio_limpio",
+            "PRECIO_SUCIO": "precio_sucio",
+            "TIR": "tasa",
+            "DURACION": "duracion",
+            "VENCIMIENTO": "fecha_vencimiento",
+            "TASA_FACIAL": "cupon",
+            "PERIODICIDAD": "frecuencia_cupon",
+            "FECHA_VALORACION": "fecha",
+            # Columnas de archivos Excel/CSV (formato original)
             "Código ISIN": "isin",
             "Emisor": "emisor",
             "Tipo": "tipo_instrumento",
@@ -39,7 +52,19 @@ class IngestionService:
             "Frecuencia Cupón": "frecuencia_cupon",
         },
         Provider.PRECIA: {
+            # Columnas de Supabase (mayúsculas)
             "ISIN": "isin",
+            "EMISION": "emisor",
+            "TIPO_ACTIVO": "tipo_instrumento",
+            "PRECIO_LIMPIO": "precio_limpio",
+            "PRECIO_SUCIO": "precio_sucio",
+            "TIR": "tasa",
+            "DURACION": "duracion",
+            "VENCIMIENTO": "fecha_vencimiento",
+            "TASA_FACIAL": "cupon",
+            "PERIODICIDAD": "frecuencia_cupon",
+            "FECHA_VALORACION": "fecha",
+            # Columnas de archivos Excel/CSV (formato original)
             "Código ISIN": "isin",
             "Emisor": "emisor",
             "Tipo": "tipo_instrumento",
@@ -60,9 +85,15 @@ class IngestionService:
         }
     }
     
-    def __init__(self, db: Session, supabase_email: Optional[str] = None, supabase_password: Optional[str] = None):
+    def __init__(self, db: Session, supabase_api_key: Optional[str] = None, supabase_access_token: Optional[str] = None):
         self.db = db
-        self.supabase = SupabaseService(email=supabase_email, password=supabase_password)
+        # Usar access token si está disponible, sino usar API key
+        if supabase_access_token:
+            self.supabase = SupabaseService(access_token=supabase_access_token)
+        elif supabase_api_key:
+            self.supabase = SupabaseService(api_key=supabase_api_key)
+        else:
+            self.supabase = SupabaseService()
     
     def normalize_column_names(self, df: pd.DataFrame, provider: Provider) -> pd.DataFrame:
         """
@@ -273,8 +304,19 @@ class IngestionService:
             
             # Determinar fecha de valoración
             if not fecha_valoracion:
-                if 'fecha' in df.columns and not df['fecha'].isna().all():
-                    fecha_valoracion = pd.to_datetime(df['fecha'].iloc[0]).date()
+                # Buscar columna de fecha (puede ser 'fecha', 'FECHA_VALORACION', etc.)
+                fecha_col = None
+                for col in df.columns:
+                    col_upper = col.upper()
+                    if col_upper in ['FECHA_VALORACION', 'FECHA', 'DATE', 'VALUATION_DATE']:
+                        fecha_col = col
+                        break
+                
+                if fecha_col and not df[fecha_col].isna().all():
+                    try:
+                        fecha_valoracion = pd.to_datetime(df[fecha_col].iloc[0]).date()
+                    except:
+                        fecha_valoracion = date.today()
                 else:
                     fecha_valoracion = date.today()
             

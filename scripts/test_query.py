@@ -144,10 +144,10 @@ def main():
         test_query_by_date(db)
         test_alerts(db)
         
-        print("\n✓ Pruebas completadas")
+        print("\n[OK] Pruebas completadas")
         
     except Exception as e:
-        print(f"✗ Error: {str(e)}")
+        print(f"[ERROR] Error: {str(e)}")
         import traceback
         traceback.print_exc()
     finally:
@@ -156,6 +156,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 

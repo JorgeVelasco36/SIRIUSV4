@@ -1,0 +1,68 @@
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║          🔴 IMPORTANTE: LEE ESTO PRIMERO                 ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+
+SIRIUS NO está corriendo automáticamente. Debes iniciarlo tú mismo.
+
+═══════════════════════════════════════════════════════════
+
+✅ OPCIÓN 1: USAR EL SCRIPT (MÁS FÁCIL)
+
+   1. Haz doble clic en este archivo:
+      📄 INICIAR_SIRIUS_SIMPLE.bat
+
+   2. Espera a ver: "Application startup complete"
+
+   3. Abre tu navegador en: http://localhost:8000
+
+   ⚠️ NO CIERRES LA VENTANA que se abrió
+
+
+═══════════════════════════════════════════════════════════
+
+✅ OPCIÓN 2: MANUALMENTE DESDE POWERSHELL
+
+   1. Abre PowerShell
+   
+   2. Copia y pega estos comandos (uno por uno):
+
+      cd "C:\Users\JEVD4139\Desktop\Documentos\Micro Inteligencia Artificial\Proyecto\SIRIUS\V4\backend"
+
+      python -m uvicorn main:app --reload
+
+   3. Espera a ver: "Application startup complete"
+
+   4. Abre tu navegador en: http://localhost:8000
+
+   ⚠️ NO CIERRES LA VENTANA de PowerShell
+
+
+═══════════════════════════════════════════════════════════
+
+🔍 SI NO FUNCIONA:
+
+   Ejecuta: DIAGNOSTICO_SIRIUS.bat
+   
+   Este script te dirá exactamente qué está fallando.
+
+
+═══════════════════════════════════════════════════════════
+
+📚 MÁS INFORMACIÓN:
+
+   - INSTRUCCIONES_ACTIVAR.md (guía completa)
+   - SOLUCION_PROBLEMA.md (soluciones a problemas comunes)
+
+
+═══════════════════════════════════════════════════════════
+
+❓ ¿POR QUÉ NO SE INICIA SOLO?
+
+   Porque el servidor DEBE mantener una ventana abierta
+   para mostrar mensajes y errores. No puede ejecutarse
+   "oculto" en segundo plano de manera confiable.
+
+═══════════════════════════════════════════════════════════
+

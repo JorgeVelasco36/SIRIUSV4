@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 class ChatService:
     """Servicio para procesar consultas en lenguaje natural y generar respuestas"""
     
-    def __init__(self, db: Session, supabase_access_token: Optional[str] = None):
+    def __init__(self, db: Session, supabase_access_token: Optional[str] = None, 
+                 conversation_context: Optional[Dict] = None):
         self.db = db
         self.query_service = QueryService(db)
         self.supabase_access_token = supabase_access_token
@@ -30,9 +31,17 @@ class ChatService:
         self.temperature = settings.llm_temperature
         
         # Contexto de conversación (última consulta y resultados)
-        self.last_query = None
-        self.last_results = None
-        self.last_query_params = None
+        # Si se proporciona contexto existente, usarlo; sino, inicializar vacío
+        if conversation_context:
+            # Deserializar contexto
+            self.last_query = self._deserialize_query(conversation_context.get("last_query_dict"))
+            self.last_results = self._deserialize_results(conversation_context.get("last_results_dict"))
+            self.last_query_params = conversation_context.get("last_query_params")
+            logger.info(f"Contexto de conversación cargado: {len(self.last_results) if self.last_results else 0} resultados previos")
+        else:
+            self.last_query = None
+            self.last_results = None
+            self.last_query_params = None
         
         # Inicializar servicio de conocimiento
         try:
@@ -41,6 +50,68 @@ class ChatService:
         except Exception as e:
             logger.warning(f"No se pudo inicializar el servicio de conocimiento: {str(e)}")
             self.knowledge_service = None
+    
+    def get_conversation_context(self) -> Dict:
+        """Retorna el contexto actual de la conversación para persistir entre requests"""
+        # Serializar objetos para que sean JSON-serializables
+        return {
+            "last_query_dict": self._serialize_query(self.last_query) if self.last_query else None,
+            "last_results_dict": self._serialize_results(self.last_results) if self.last_results else None,
+            "last_query_params": self.last_query_params
+        }
+    
+    def _serialize_query(self, query) -> Optional[Dict]:
+        """Serializa ValuationQuery a diccionario"""
+        if not query:
+            return None
+        return {
+            "isin": query.isin,
+            "isins": query.isins,
+            "proveedor": query.proveedor.value if query.proveedor else None,
+            "fecha": query.fecha.isoformat() if query.fecha else None,
+            "fecha_inicio": query.fecha_inicio.isoformat() if query.fecha_inicio else None,
+            "fecha_fin": query.fecha_fin.isoformat() if query.fecha_fin else None,
+            "emisor": query.emisor,
+            "tipo_instrumento": query.tipo_instrumento,
+            "fecha_vencimiento": query.fecha_vencimiento.isoformat() if query.fecha_vencimiento else None,
+            "cupon": query.cupon
+        }
+    
+    def _deserialize_query(self, query_dict: Optional[Dict]):
+        """Deserializa diccionario a ValuationQuery"""
+        if not query_dict:
+            return None
+        from schemas import ValuationQuery
+        from models import Provider
+        from datetime import datetime
+        
+        return ValuationQuery(
+            isin=query_dict.get("isin"),
+            isins=query_dict.get("isins"),
+            proveedor=Provider(query_dict["proveedor"]) if query_dict.get("proveedor") else None,
+            fecha=datetime.fromisoformat(query_dict["fecha"]).date() if query_dict.get("fecha") else None,
+            fecha_inicio=datetime.fromisoformat(query_dict["fecha_inicio"]).date() if query_dict.get("fecha_inicio") else None,
+            fecha_fin=datetime.fromisoformat(query_dict["fecha_fin"]).date() if query_dict.get("fecha_fin") else None,
+            emisor=query_dict.get("emisor"),
+            tipo_instrumento=query_dict.get("tipo_instrumento"),
+            fecha_vencimiento=datetime.fromisoformat(query_dict["fecha_vencimiento"]).date() if query_dict.get("fecha_vencimiento") else None,
+            cupon=query_dict.get("cupon")
+        )
+    
+    def _serialize_results(self, results: Optional[List]) -> Optional[List[Dict]]:
+        """Serializa lista de Valuation a lista de diccionarios"""
+        if not results:
+            return None
+        return [self._valuation_to_dict(v) for v in results]
+    
+    def _deserialize_results(self, results_dict: Optional[List[Dict]]):
+        """Deserializa lista de diccionarios a lista de Valuation"""
+        if not results_dict:
+            return None
+        # No podemos recrear objetos Valuation directamente desde dict sin consultar la BD
+        # Por ahora, guardamos los diccionarios y los usamos directamente
+        # Esto es suficiente para mostrar resultados sin necesidad de objetos completos
+        return results_dict
     
     def extract_intent(self, message: str) -> Dict:
         """
@@ -195,12 +266,22 @@ class ChatService:
             match = re.search(nemotecnico_explicit_pattern, message_upper)
             if match:
                 nemotecnico_explicito = match.group(1)
-                result["_nemotecnico"] = nemotecnico_explicito
-                result["nemotecnico"] = nemotecnico_explicito
-                result["_search_type"] = "nemotecnico"
-                result["isins"] = []  # Asegurar que no haya ISINs
-                logger.info(f"Nemotécnico explícito detectado (fallback): {nemotecnico_explicito}")
-                return result
+                # Verificar que no sea una palabra común
+                if nemotecnico_explicito.upper() not in ['FACIAL', 'CUPON', 'CUPÓN', 'TASA', 'BANCO', 'BANCARIO']:
+                    result["_nemotecnico"] = nemotecnico_explicito
+                    result["nemotecnico"] = nemotecnico_explicito
+                    result["_search_type"] = "nemotecnico"
+                    result["isins"] = []  # Asegurar que no haya ISINs
+                    logger.info(f"Nemotécnico explícito detectado (fallback): {nemotecnico_explicito}")
+                    return result
+        
+        # Verificar si la frase contiene "tasa facial" o "cupón" para evitar interpretar "FACIAL" como nemotécnico
+        contiene_tasa_facial = "tasa facial" in message_lower or "tasa del" in message_lower
+        contiene_cupon = "cupon" in message_lower or "cupón" in message_lower
+        
+        # Si contiene estas frases, es probable que no haya nemotécnico explícito
+        if contiene_tasa_facial or contiene_cupon:
+            logger.info("Mensaje contiene 'tasa facial' o 'cupón', evitando interpretar como nemotécnico")
         
         # Intentar extraer ISIN (formato CO seguido de 10 caracteres alfanuméricos)
         # Ejemplos: CO000123456, COB07CD0PY71, COT12345678
@@ -218,6 +299,7 @@ class ChatService:
             nemotecnicos = re.findall(nemotecnico_pattern, message_upper)
             # Filtrar palabras comunes en español y términos financieros
             palabras_comunes = [
+                "BUSCANDO", "BUSCAR", "BUSCO", "BUSCÓ", "BUSQUE", "BUSQUÉ",
                 'TIR', 'CDT', 'TES', 'PIP', 'PRECIA', 'LATAM', 'ISIN', 'VALORACION', 
                 'VALORACION', 'TITULO', 'TITULOS', 'FECHA', 'VENCIMIENTO',
                 'QUISIERA', 'SABER', 'CUAL', 'ES', 'DE', 'UN', 'UNA', 'EL', 'LA',
@@ -226,7 +308,12 @@ class ChatService:
                 'PRECIO', 'TASA', 'DURACION', 'CONVEXIDAD', 'RENDIMIENTO', 'YIELD',
                 'NEMOTECNICO', 'NEMOTÉCNICO',  # Excluir la palabra misma
                 'MOSTRAR', 'MUESTRAME', 'MUESTRA', 'DAME', 'DAMELOS', 'ENSEÑAME', 'ENSEÑA',  # Acciones
-                'TITULOS', 'TÍTULOS', 'TITULO', 'TÍTULO', 'RESULTADOS', 'ESOS', 'ESAS'  # Palabras relacionadas con mostrar
+                'ENTREGAME', 'ENTREGA', 'ENTREGALA', 'ENTREGALO', 'ENTREGALOS', 'ENTREGALAS',  # Acciones de entregar
+                'ENCONTRASTE', 'ENCONTRÓ', 'ENCONTRO', 'ENCONTRADO', 'ENCONTRADOS', 'ENCONTRADAS',  # Palabras relacionadas con encontrar
+                'RESULTADO', 'RESULTADOS', 'RESULTADO', 'RESULTADAS',  # Palabras relacionadas con resultado
+                'TITULOS', 'TÍTULOS', 'TITULO', 'TÍTULO', 'ESOS', 'ESAS',  # Palabras relacionadas con mostrar
+                'FACIAL', 'CUPON', 'CUPÓN', 'TASA', 'BANCO', 'BANCARIO',  # Campos y términos financieros comunes
+                'INFORMACION', 'INFORMACIÓN', 'PROVEEDOR', 'PROVEEDORES', 'PRECIOS'  # Términos comunes
             ]
             nemotecnicos_filtrados = [
                 n for n in nemotecnicos 
@@ -282,27 +369,35 @@ class ChatService:
         
         # Extraer cupón/tasa facial del mensaje si se menciona
         message_lower = extracted.get("_original_message", "").lower()
+        message_original = extracted.get("_original_message", "")
         if "cupon" in message_lower or "tasa facial" in message_lower or "tasa del" in message_lower:
             # Intentar extraer valor numérico de cupón/tasa facial
             import re
-            # Patrones: "tasa facial es del 8.8501", "cupón del 9.5%", "tasa del 8.85", "tengo la tasa cupon, es del 8.8501%"
+            # Patrones mejorados: maneja números con punto o coma decimal
+            # Ejemplos: "tasa facial es del 8.8501", "tasa facial del 14,2232%", "cupón del 9.5%"
+            # IMPORTANTE: Ordenar patrones por especificidad (más específicos primero)
             cupon_patterns = [
-                r'(?:tengo la tasa cup[oó]n|tasa cup[oó]n|cup[oó]n).*?es del (\d+\.?\d*)',
-                r'(?:tasa facial|cup[oó]n).*?es del (\d+\.?\d*)',
-                r'(?:tasa facial|cup[oó]n).*?(\d+\.?\d*)',
-                r'tasa del (\d+\.?\d*)',
-                r'cup[oó]n del (\d+\.?\d*)',
-                r'(\d+\.?\d*)\s*%'
+                r'(?:tiene la tasa facial del|tiene la tasa facial|tiene tasa facial del|tiene tasa facial)\s*(\d+[.,]\d+|\d+)',  # "tiene la tasa facial del 14,2232%" - PRIORIDAD ALTA
+                r'(?:tengo la tasa cup[oó]n|tasa cup[oó]n|cup[oó]n).*?es del (\d+[.,]\d+|\d+)',
+                r'(?:tasa facial|cup[oó]n).*?es del (\d+[.,]\d+|\d+)',
+                r'(?:tasa facial|cup[oó]n).*?del (\d+[.,]\d+|\d+)',
+                r'(?:tasa facial|cup[oó]n).*?(\d+[.,]\d+|\d+)',
+                r'tasa del (\d+[.,]\d+|\d+)',
+                r'cup[oó]n del (\d+[.,]\d+|\d+)',
+                r'(\d+[.,]\d+|\d+)\s*%'
             ]
             for pattern in cupon_patterns:
-                match = re.search(pattern, message_lower)
+                match = re.search(pattern, message_original)  # Buscar en mensaje original para mantener formato
                 if match:
                     try:
-                        cupon_val = float(match.group(1))
+                        # Normalizar: reemplazar coma por punto para conversión a float
+                        cupon_str = match.group(1).replace(',', '.')
+                        cupon_val = float(cupon_str)
                         cupon = cupon_val
-                        logger.info(f"Tasa facial/Cupón detectado: {cupon}")
+                        logger.info(f"Tasa facial/Cupón detectado: {cupon} (de patrón: {pattern})")
                         break
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Error parseando cupón de '{match.group(1)}': {str(e)}")
                         continue
         
         # Si el LLM extrajo cupon, usarlo
@@ -328,21 +423,65 @@ class ChatService:
                     pass
         
         # Si hay una consulta anterior y el mensaje actual solo agrega información (cupón, etc.), combinar filtros
-        if self.last_query and not extracted.get("nemotecnico") and not extracted.get("isins"):
+        # Detectar si es una consulta de refinamiento: no tiene nemotécnico/ISIN nuevo, pero puede tener cupón, tasa facial, etc.
+        # IMPORTANTE: También detectar frases como "estoy buscando", "busco", etc. como refinamiento
+        tiene_frases_busqueda = any(frase in message_lower for frase in [
+            "estoy buscando", "busco", "busca", "quiero el", "necesito el", 
+            "el titulo que", "el título que", "titulo que tiene", "título que tiene"
+        ])
+        
+        # IMPORTANTE: Detectar refinamiento de manera más robusta
+        # Un mensaje es refinamiento si:
+        # 1. Hay resultados previos (last_results)
+        # 2. NO hay nemotécnico/ISIN nuevo (es continuación de búsqueda anterior)
+        # 3. Tiene características adicionales (cupón, tasa facial) O frases de búsqueda/refinamiento
+        mensaje_es_refinamiento = (
+            self.last_query and 
+            self.last_results and 
+            len(self.last_results) > 0 and
+            not extracted.get("nemotecnico") and 
+            not extracted.get("_nemotecnico") and
+            not extracted.get("isins") and
+            (
+                cupon is not None or 
+                "cupon" in message_lower or 
+                "tasa facial" in message_lower or 
+                "tasa del" in message_lower or
+                tiene_frases_busqueda or
+                # Detectar frases específicas de refinamiento
+                any(frase in message_lower for frase in [
+                    "que tiene", "que tiene la", "que tenga", "con tasa", "con cupón",
+                    "título que", "titulo que"
+                ])
+            )
+        )
+        
+        if mensaje_es_refinamiento:
             # El usuario está refinando la búsqueda anterior
-            logger.info("Combinando filtros con la consulta anterior")
+            logger.info("Detectado refinamiento: combinando filtros con la consulta anterior")
             # Usar nemotécnico y fecha de vencimiento de la consulta anterior
             if self.last_query.emisor and self.last_query.tipo_instrumento:
                 emisor = self.last_query.emisor
                 tipo_instrumento = self.last_query.tipo_instrumento
+                logger.info(f"Usando nemotécnico de consulta anterior: {emisor}")
             if self.last_query.fecha_vencimiento:
                 fecha_vencimiento = self.last_query.fecha_vencimiento
+                logger.info(f"Usando fecha de vencimiento de consulta anterior: {fecha_vencimiento}")
             if self.last_query.isin:
                 isin = self.last_query.isin
-            # Si no se extrajo cupón del mensaje actual, usar el de la consulta anterior
-            if not cupon and self.last_query.cupon is not None:
+                logger.info(f"Usando ISIN de consulta anterior: {isin}")
+            # Si se extrajo cupón del mensaje actual, usarlo (prioridad al nuevo)
+            if cupon is not None:
+                logger.info(f"Usando cupón del mensaje actual para refinar: {cupon}")
+            elif self.last_query.cupon is not None:
                 cupon = self.last_query.cupon
                 logger.info(f"Usando cupón de la consulta anterior: {cupon}")
+            # Mantener proveedor y fecha de valoración de la consulta anterior si no se especifican nuevos
+            if not extracted.get("provider") and self.last_query.proveedor:
+                # Se manejará después en el ValuationQuery
+                pass
+            if not fecha and self.last_query.fecha:
+                fecha = self.last_query.fecha
         else:
             # Verificar si hay nemotécnico (del LLM o del fallback)
             nemotecnico_detectado = extracted.get("nemotecnico") or extracted.get("_nemotecnico")
@@ -374,7 +513,11 @@ class ChatService:
                 # No se detectó ni ISIN ni nemotécnico
                 logger.warning("No se detectó ni ISIN ni nemotécnico en la consulta")
         
-        return ValuationQuery(
+        # IMPORTANTE: Si se detectó refinamiento y se extrajo cupón, asegurar que se asigne
+        if mensaje_es_refinamiento and cupon is not None:
+            logger.info(f"🔧 Asignando cupón {cupon} al query de refinamiento")
+        
+        query_result = ValuationQuery(
             isin=isin,
             isins=isins,
             proveedor=Provider(extracted["provider"]) if extracted.get("provider") else None,
@@ -386,6 +529,17 @@ class ChatService:
             fecha_vencimiento=fecha_vencimiento,
             cupon=cupon
         )
+        
+        # Log final del query construido
+        logger.info(f"📝 Query construido: emisor={emisor}, tipo_instrumento={tipo_instrumento}, fecha_vencimiento={fecha_vencimiento}, cupon={cupon}, mensaje_es_refinamiento={mensaje_es_refinamiento}")
+        
+        return query_result
+    
+    def _get_valuation_field(self, v, field: str):
+        """Helper para obtener un campo de una valoración (objeto o diccionario)"""
+        if isinstance(v, dict):
+            return v.get(field)
+        return getattr(v, field, None)
     
     def format_valuation_table(self, valuations: List) -> str:
         """Formatea valoraciones como tabla de texto"""
@@ -397,14 +551,27 @@ class ChatService:
         lines.append("|------|-----------|-------|---------------|--------------|------|----------|")
         
         for v in valuations:
-            precio_limpio = f"{v.precio_limpio:.2f}" if v.precio_limpio else "N/A"
-            precio_sucio = f"{v.precio_sucio:.2f}" if v.precio_sucio else "N/A"
-            tasa = f"{v.tasa:.4f}" if v.tasa else "N/A"
-            duracion = f"{v.duracion:.2f}" if v.duracion else "N/A"
+            isin = self._get_valuation_field(v, "isin") or "N/A"
+            proveedor = self._get_valuation_field(v, "proveedor")
+            if isinstance(proveedor, dict):
+                proveedor_val = proveedor.get("value", proveedor) if isinstance(proveedor, dict) else proveedor
+            else:
+                proveedor_val = proveedor.value if hasattr(proveedor, "value") else proveedor
+            fecha = self._get_valuation_field(v, "fecha")
+            precio_limpio = self._get_valuation_field(v, "precio_limpio")
+            precio_sucio = self._get_valuation_field(v, "precio_sucio")
+            tasa = self._get_valuation_field(v, "tasa")
+            duracion = self._get_valuation_field(v, "duracion")
+            
+            precio_limpio_str = f"{precio_limpio:.2f}" if precio_limpio is not None else "N/A"
+            precio_sucio_str = f"{precio_sucio:.2f}" if precio_sucio is not None else "N/A"
+            tasa_str = f"{tasa:.4f}" if tasa is not None else "N/A"
+            duracion_str = f"{duracion:.2f}" if duracion is not None else "N/A"
+            fecha_str = str(fecha) if fecha else "N/A"
             
             lines.append(
-                f"| {v.isin} | {v.proveedor.value} | {v.fecha} | {precio_limpio} | "
-                f"{precio_sucio} | {tasa} | {duracion} |"
+                f"| {isin} | {proveedor_val} | {fecha_str} | {precio_limpio_str} | "
+                f"{precio_sucio_str} | {tasa_str} | {duracion_str} |"
             )
         
         return "\n".join(lines)
@@ -421,20 +588,151 @@ class ChatService:
             Diccionario con respuesta estructurada
         """
         try:
-            # Detectar si es una acción de "mostrar" resultados
+            # Detectar si es una acción de "mostrar" resultados ANTES de extraer intención
+            # Esto evita que se interprete "ENTREGAME" como nemotécnico
             message_lower = message.lower()
-            es_accion_mostrar = any(palabra in message_lower for palabra in [
-                "mostrar", "muestrame", "muestra", "dame", "damelos", "enseñame", "enseña",
-                "muestrame esos", "muestrame las", "muestrame los", "dame esos", "dame las", "dame los"
+            # Detectar acciones de mostrar - incluir frases completas para mejor detección
+            es_accion_mostrar = (
+                any(palabra in message_lower for palabra in [
+                    "mostrar", "muestrame", "muestra", "dame", "damelos", "enseñame", "enseña",
+                    "muestrame esos", "muestrame las", "muestrame los", "dame esos", "dame las", "dame los",
+                    "entregame", "entrega", "entregame la", "entregame los", "entregame las",
+                    "dame la informacion", "dame la información", "muestrame la informacion", "muestrame la información",
+                    "entregame la informacion", "entregame la información", "dame el titulo", "dame el título",
+                    "muestrame el titulo", "muestrame el título", "entregame el titulo", "entregame el título",
+                    "ambos proveedores", "de ambos proveedores", "por ambos proveedores"
+                ]) or
+                any(frase in message_lower for frase in [
+                    "del titulo que encontraste", "del título que encontraste",
+                    "del titulo que encontró", "del título que encontró",
+                    "del titulo encontrado", "del título encontrado",
+                    "la informacion del titulo", "la información del título",
+                    "la informacion del titulo que", "la información del título que",
+                    "muestrame la informacion del", "muestrame la información del",
+                    "dame la informacion del", "dame la información del",
+                    "entregame la informacion del", "entregame la información del"
+                ])
+            )
+            
+            # IMPORTANTE: Antes de tratar como acción de mostrar, verificar si es una búsqueda nueva
+            # Si la consulta tiene indicadores claros de búsqueda (nemotécnico, ISIN, "cuál es", etc.),
+            # NO es acción de mostrar, es una búsqueda nueva
+            import re
+            message_upper_check = message.upper()
+            tiene_isin_en_mensaje = bool(re.search(r'\bCO[A-Z0-9]{10}\b', message_upper_check))
+            tiene_palabras_busqueda = any(palabra in message_lower for palabra in [
+                "cuál es", "cual es", "cuál es la", "cual es la", "quiero saber", "necesito",
+                "valoración de un", "valoracion de un", "tir de valoración", "precio de"
             ])
             
-            # Si es acción de mostrar y hay resultados de la consulta anterior, usarlos
-            if es_accion_mostrar and self.last_results is not None:
+            # Si tiene indicadores claros de búsqueda nueva, NO es acción de mostrar
+            if tiene_isin_en_mensaje or tiene_palabras_busqueda:
+                es_accion_mostrar = False
+                logger.info("Consulta detectada como búsqueda nueva (tiene ISIN o palabras clave de búsqueda), NO es acción de mostrar"            )
+            
+            # IMPORTANTE: Verificar si es una búsqueda nueva antes de tratar como acción de mostrar
+            # Si la consulta tiene palabras clave de búsqueda nueva, NO es acción de mostrar
+            tiene_palabras_busqueda_nueva = any(palabra in message_lower for palabra in [
+                "cuál es", "cual es", "cuál es la", "cual es la", 
+                "quiero saber", "necesito", "valoración de un", "valoracion de un",
+                "tir de valoración", "precio de", "con vencimiento"
+            ])
+            
+            # Si tiene palabras clave de búsqueda nueva, NO es acción de mostrar
+            if tiene_palabras_busqueda_nueva:
+                es_accion_mostrar = False
+                logger.info("Consulta detectada como búsqueda nueva (tiene palabras clave de búsqueda), NO es acción de mostrar")
+            
+            # Si es acción de mostrar y hay resultados de la consulta anterior, usarlos DIRECTAMENTE
+            # Sin intentar extraer nemotécnicos ni hacer nuevas búsquedas
+            if es_accion_mostrar and self.last_results is not None and len(self.last_results) > 0:
                 logger.info(f"Acción 'mostrar' detectada, usando {len(self.last_results)} resultados de la consulta anterior")
-                answer = f"Se encontraron {len(self.last_results)} títulos que coinciden con tu búsqueda:\n\n"
-                answer += self.format_valuation_table(self.last_results)
-                recommendations = self._generate_general_recommendations(self.last_results)
-                data = [self._valuation_to_dict(v) for v in self.last_results]
+                logger.info(f"Última consulta: emisor={self.last_query.emisor if self.last_query else None}, fecha_vencimiento={self.last_query.fecha_vencimiento if self.last_query else None}, cupon={self.last_query.cupon if self.last_query else None}")
+                
+                # Validar formato de resultados
+                try:
+                    # Verificar que los resultados sean una lista válida
+                    if not isinstance(self.last_results, list):
+                        logger.error(f"last_results no es una lista: {type(self.last_results)}")
+                        raise ValueError(f"Formato inválido de resultados: se esperaba lista, se obtuvo {type(self.last_results)}")
+                    
+                    # Verificar que cada resultado sea un objeto o diccionario válido
+                    for idx, result in enumerate(self.last_results):
+                        if not isinstance(result, (dict, object)):
+                            logger.error(f"Resultado {idx} tiene formato inválido: {type(result)}")
+                            raise ValueError(f"Resultado {idx} tiene formato inválido: {type(result)}")
+                except Exception as e:
+                    logger.error(f"Error validando formato de resultados: {str(e)}")
+                    # Limpiar resultados inválidos y continuar sin contexto
+                    self.last_results = None
+                    self.last_query = None
+                
+                # Verificar si el usuario pide "ambos proveedores" o información de todos los proveedores
+                pide_ambos_proveedores = any(frase in message_lower for frase in [
+                    "ambos proveedores", "de ambos proveedores", "por ambos proveedores",
+                    "todos los proveedores", "de todos los proveedores"
+                ])
+                
+                # IMPORTANTE: Usar SOLO los resultados de la consulta anterior (last_results)
+                # NO ejecutar ninguna consulta nueva
+                resultados_a_mostrar = self.last_results
+                
+                # Si los resultados son diccionarios (del contexto deserializado), convertir a formato compatible
+                if resultados_a_mostrar and isinstance(resultados_a_mostrar[0], dict):
+                    # Ya están en formato diccionario, los usamos directamente
+                    pass
+                
+                # Validar que no estamos mostrando todos los resultados de la BD
+                # Si hay más de 100 resultados, algo está mal (probablemente se ejecutó una consulta sin filtros)
+                if len(resultados_a_mostrar) > 100:
+                    logger.warning(f"ADVERTENCIA: Se detectaron {len(resultados_a_mostrar)} resultados en last_results. Esto podría indicar que se ejecutó una consulta sin filtros.")
+                    # Intentar filtrar por los parámetros de la última consulta si están disponibles
+                    if self.last_query:
+                        logger.info(f"Filtrando resultados por última consulta: emisor={self.last_query.emisor}, fecha_vencimiento={self.last_query.fecha_vencimiento}, cupon={self.last_query.cupon}")
+                        # Filtrar resultados por los parámetros de la última consulta
+                        resultados_filtrados = []
+                        for v in resultados_a_mostrar:
+                            match = True
+                            emisor_val = self._get_valuation_field(v, "emisor")
+                            tipo_instrumento_val = self._get_valuation_field(v, "tipo_instrumento")
+                            fecha_vencimiento_val = self._get_valuation_field(v, "fecha_vencimiento")
+                            cupon_val = self._get_valuation_field(v, "cupon")
+                            
+                            if self.last_query.emisor and self.last_query.tipo_instrumento:
+                                # Búsqueda por nemotécnico
+                                if self.last_query.emisor.upper() not in (emisor_val or "").upper() and self.last_query.emisor.upper() not in (tipo_instrumento_val or "").upper():
+                                    match = False
+                            if self.last_query.fecha_vencimiento and fecha_vencimiento_val:
+                                if fecha_vencimiento_val != self.last_query.fecha_vencimiento:
+                                    match = False
+                            if self.last_query.cupon is not None and cupon_val is not None:
+                                if abs(cupon_val - self.last_query.cupon) > 0.01:
+                                    match = False
+                            if match:
+                                resultados_filtrados.append(v)
+                        
+                        if len(resultados_filtrados) < len(resultados_a_mostrar):
+                            logger.info(f"Resultados filtrados: {len(resultados_a_mostrar)} → {len(resultados_filtrados)}")
+                            resultados_a_mostrar = resultados_filtrados
+                
+                # Contar títulos únicos para mensaje más preciso
+                isins_unicos = set(self._get_valuation_field(v, "isin") for v in resultados_a_mostrar if self._get_valuation_field(v, "isin"))
+                num_titulos = len(isins_unicos)
+                
+                # Formatear respuesta
+                if num_titulos == 1:
+                    answer = f"Información del título encontrado"
+                else:
+                    answer = f"Información de {num_titulos} títulos encontrados"
+                
+                if pide_ambos_proveedores:
+                    answer += " (ambos proveedores):\n\n"
+                else:
+                    answer += ":\n\n"
+                
+                answer += self.format_valuation_table(resultados_a_mostrar)
+                recommendations = self._generate_general_recommendations(resultados_a_mostrar)
+                data = [self._valuation_to_dict(v) for v in resultados_a_mostrar]
                 
                 return {
                     "answer": answer,
@@ -446,8 +744,23 @@ class ChatService:
                     }
                 }
             
-            # Extraer intención
+            # Si es acción de mostrar pero NO hay resultados previos, continuar con búsqueda normal
+            # (puede que el usuario quiera mostrar resultados de una nueva búsqueda)
+            
+            # Extraer intención (solo si no se procesó como acción de mostrar)
+            # NOTA: Si es acción de mostrar Y hay resultados previos, ya se procesó arriba y se retornó
+            # Por lo tanto, si llegamos aquí, es porque NO hay resultados previos o NO es acción de mostrar
+            
             extracted = self.extract_intent(message)
+            
+            # Si es acción de mostrar, marcar explícitamente para evitar malas interpretaciones
+            if es_accion_mostrar:
+                extracted["_es_accion_mostrar"] = True
+                # Forzar que no haya nemotécnico si es acción de mostrar
+                if extracted.get("nemotecnico"):
+                    logger.info(f"Acción de mostrar detectada, ignorando nemotécnico detectado: {extracted.get('nemotecnico')}")
+                    extracted["nemotecnico"] = None
+                    extracted["_nemotecnico"] = None
             # Guardar mensaje original para análisis posterior
             extracted["_original_message"] = message
             extracted["_es_accion_mostrar"] = es_accion_mostrar
@@ -455,161 +768,560 @@ class ChatService:
             # Construir query
             query = self.build_query(extracted)
             
-            # Ejecutar consulta
-            if extracted["intent"] == "comparacion" and query.isin:
-                # Comparación entre proveedores
-                comparison = self.query_service.compare_providers(query.isin, query.fecha)
+            # IMPORTANTE: Si hay last_results y el usuario está refinando con características adicionales (cupón, etc.),
+            # filtrar sobre last_results en lugar de hacer una nueva búsqueda
+            message_lower = message.lower()
+            tiene_cupon_o_tasa = (
+                query.cupon is not None or 
+                "cupon" in message_lower or 
+                "tasa facial" in message_lower or 
+                "tasa del" in message_lower
+            )
+            tiene_frases_refinamiento = any(frase in message_lower for frase in [
+                "estoy buscando", "busco", "busca", "quiero el", "necesito el", 
+                "el titulo que", "el título que", "titulo que tiene", "título que tiene"
+            ])
+            
+            # Si hay resultados previos y el usuario está refinando, filtrar sobre esos resultados
+            # Detectar si está proporcionando características adicionales para refinar
+            tiene_caracteristicas_adicionales = (
+                query.cupon is not None or
+                query.fecha_vencimiento is not None or
+                "cupon" in message_lower or 
+                "tasa facial" in message_lower or 
+                "tasa del" in message_lower or
+                "vencimiento" in message_lower or
+                "vencen" in message_lower
+            )
+            
+            # IMPORTANTE: Detectar refinamiento ANTES de ejecutar consulta normal
+            # Un refinamiento es cuando:
+            # 1. Hay resultados previos (last_results)
+            # 2. El mensaje NO tiene nemotécnico/ISIN nuevo
+            # 3. El mensaje tiene características adicionales (cupón, tasa facial) O frases de refinamiento
+            es_refinamiento_detectado = (
+                self.last_results and 
+                len(self.last_results) > 0 and 
+                not extracted.get("nemotecnico") and 
+                not extracted.get("_nemotecnico") and
+                not extracted.get("isins") and
+                (
+                    query.cupon is not None or
+                    tiene_frases_refinamiento or
+                    tiene_cupon_o_tasa or
+                    tiene_caracteristicas_adicionales
+                )
+            )
+            
+            # Inicializar valuations para evitar error de variable no definida
+            valuations = None
+            
+            if es_refinamiento_detectado:
+                logger.info(f"🔄 REFINAMIENTO DETECTADO: filtrando {len(self.last_results)} resultados previos")
+                logger.info(f"   Frases de refinamiento: {tiene_frases_refinamiento}")
+                logger.info(f"   Tiene cupón/tasa: {tiene_cupon_o_tasa}, cupón={query.cupon}")
+                logger.info(f"   Características adicionales: {tiene_caracteristicas_adicionales}")
                 
-                if "error" in comparison:
-                    answer = f"No se encontraron datos para comparación del ISIN {query.isin}."
-                    recommendations = [
-                        "Verificar que el ISIN existe en la base de datos",
-                        "Confirmar que hay valoraciones para la fecha solicitada",
-                        "Revisar archivos de ingesta recientes"
-                    ]
-                    data = None
+                # IMPORTANTE: Guardar los resultados originales ANTES de filtrar
+                # Esto permite mostrar cuántos títulos había antes del filtro
+                resultados_originales_antes_filtro = []
+                if self.last_results:
+                    # Crear una copia profunda de los resultados originales
+                    import copy
+                    resultados_originales_antes_filtro = copy.deepcopy(self.last_results)
+                    logger.info(f"💾 Guardados {len(resultados_originales_antes_filtro)} resultados originales antes del filtro")
+                
+                # Filtrar last_results por cupón si se especificó
+                if query.cupon is not None:
+                    cupon_min = query.cupon - 0.01
+                    cupon_max = query.cupon + 0.01
+                    resultados_filtrados = []
+                    logger.info(f"🔍 Buscando cupón entre {cupon_min:.6f} y {cupon_max:.6f} (valor buscado: {query.cupon:.6f})")
+                    
+                    # Log de cupones en last_results para debugging
+                    cupones_encontrados = []
+                    for v in self.last_results:
+                        cupon_val = self._get_valuation_field(v, "cupon")
+                        isin_val = self._get_valuation_field(v, "isin")
+                        if cupon_val is not None:
+                            cupones_encontrados.append(f"ISIN={isin_val}, cupon={cupon_val:.6f}")
+                        if cupon_val is not None and cupon_min <= cupon_val <= cupon_max:
+                            resultados_filtrados.append(v)
+                            logger.info(f"   ✅ ISIN {isin_val} pasó el filtro: cupon={cupon_val:.6f} está en rango [{cupon_min:.6f}, {cupon_max:.6f}]")
+                        elif cupon_val is not None:
+                            logger.info(f"   ❌ ISIN {isin_val} NO pasó el filtro: cupon={cupon_val:.6f} está fuera del rango [{cupon_min:.6f}, {cupon_max:.6f}] (diferencia: {abs(cupon_val - query.cupon):.6f})")
+                        else:
+                            logger.info(f"   ⚠️ ISIN {isin_val} no tiene cupón disponible")
+                    
+                    logger.info(f"📋 Cupones encontrados en last_results: {cupones_encontrados}")
+                    logger.info(f"✅ Filtrado por cupón {query.cupon}: {len(self.last_results)} → {len(resultados_filtrados)} resultados")
+                    valuations = resultados_filtrados
+                    
+                    # IMPORTANTE: Guardar los resultados originales ANTES de actualizar last_results
+                    # Esto permite mostrar cuántos títulos había antes del filtro
+                    resultados_originales_antes_filtro = self.last_results.copy() if self.last_results else []
+                    
+                    # Actualizar last_results con los resultados filtrados
+                    self.last_results = valuations
+                    
+                    # Actualizar last_query con el cupón agregado
+                    if self.last_query:
+                        self.last_query.cupon = query.cupon
+                    
+                    # Guardar información del refinamiento para usar después
+                    refinamiento_con_cupon = True
+                    num_resultados_originales = len(resultados_originales_antes_filtro)
                 else:
-                    answer = self._format_comparison(comparison)
-                    recommendations = self._generate_comparison_recommendations(comparison)
-                    # Convertir comparación a lista para mantener consistencia con el schema
-                    data = [comparison] if comparison else None
+                    # Si no hay cupón pero hay frases de refinamiento, usar last_results directamente
+                    logger.warning(f"⚠️ Refinamiento detectado pero NO se encontró cupón en el query. query.cupon={query.cupon}, cupon extraído={cupon if 'cupon' in locals() else 'no definido'}")
+                    logger.info(f"Revisando si el cupón se extrajo correctamente del mensaje...")
+                    valuations = self.last_results
+                    logger.info(f"Usando resultados previos sin filtro adicional: {len(valuations)} resultados")
                 
-            elif query.isins or (query.isin and len(extracted.get("isins", [])) > 1):
-                # Múltiples ISINs
-                valuations = self.query_service.query_valuations(query, self.supabase_access_token)
-                answer = f"Se encontraron {len(valuations)} valoraciones:\n\n"
-                answer += self.format_valuation_table(valuations)
-                recommendations = self._generate_general_recommendations(valuations)
-                data = [self._valuation_to_dict(v) for v in valuations]
+                # Actualizar last_query_params con el cupón agregado si existe
+                if self.last_query:
+                    self.last_query_params = {
+                        "isin": self.last_query.isin,
+                        "emisor": self.last_query.emisor,
+                        "tipo_instrumento": self.last_query.tipo_instrumento,
+                        "fecha_vencimiento": self.last_query.fecha_vencimiento.isoformat() if self.last_query.fecha_vencimiento else None,
+                        "cupon": self.last_query.cupon
+                    }
                 
+                # IMPORTANTE: Marcar que se detectó refinamiento para usar en el procesamiento de resultados
+                refinamiento_realizado = True
+                
+                # IMPORTANTE: Saltar la ejecución de consulta normal y continuar directamente con el procesamiento de resultados
+                # Las valuations ya están filtradas, así que continuamos con el código de procesamiento de resultados
+                # (saltamos todo el bloque else que ejecuta consultas nuevas)
+                logger.info(f"🔄 Continuando con procesamiento de resultados refinados: {len(valuations)} resultados filtrados")
             else:
-                # Consulta simple
-                logger.info(f"Ejecutando consulta: isin={query.isin}, emisor={query.emisor}, tipo_instrumento={query.tipo_instrumento}, fecha_vencimiento={query.fecha_vencimiento}, cupon={query.cupon}")
-                valuations = self.query_service.query_valuations(query, self.supabase_access_token)
-                logger.info(f"Consulta completada: se encontraron {len(valuations)} valoraciones después de aplicar todos los filtros")
+                # No es refinamiento
+                refinamiento_realizado = False
+                # Ejecutar consulta normal (NO es refinamiento)
+                logger.info("Ejecutando consulta normal (no es refinamiento)")
                 
-                # Guardar consulta y resultados para contexto de conversación
-                self.last_query = query
-                self.last_results = valuations
-                self.last_query_params = {
-                    "isin": query.isin,
-                    "emisor": query.emisor,
-                    "tipo_instrumento": query.tipo_instrumento,
-                    "fecha_vencimiento": query.fecha_vencimiento.isoformat() if query.fecha_vencimiento else None,
-                    "cupon": query.cupon
-                }
+                # Ejecutar consulta
+                if extracted["intent"] == "comparacion" and query.isin:
+                    # Comparación entre proveedores
+                    comparison = self.query_service.compare_providers(query.isin, query.fecha)
+                    
+                    if "error" in comparison:
+                        answer = f"No se encontraron datos para comparación del ISIN {query.isin}."
+                        recommendations = [
+                            "Verificar que el ISIN existe en la base de datos",
+                            "Confirmar que hay valoraciones para la fecha solicitada",
+                            "Revisar archivos de ingesta recientes"
+                        ]
+                        data = None
+                    else:
+                        answer = self._format_comparison(comparison)
+                        recommendations = self._generate_comparison_recommendations(comparison)
+                        # Convertir comparación a lista para mantener consistencia con el schema
+                        data = [comparison] if comparison else None
+                    
+                    # Retornar respuesta de comparación directamente
+                    return {
+                        "answer": answer,
+                        "recommendations": recommendations,
+                        "data": data,
+                        "metadata": {
+                            "intent": "comparacion",
+                            "query_params": self.last_query_params
+                        }
+                    }
                 
-                # Si es una acción de "mostrar", mostrar todos los resultados directamente
-                if es_accion_mostrar and valuations:
-                    answer = f"Se encontraron {len(valuations)} títulos que coinciden con tu búsqueda:\n\n"
-                    answer += self.format_valuation_table(valuations)
+                elif query.isins or (query.isin and len(extracted.get("isins", [])) > 1):
+                    # Múltiples ISINs
+                    valuations = self.query_service.query_valuations(query, self.supabase_access_token)
+                    answer = f"Se encontraron {len(valuations)} valoraciones:\n\n"
+                    # No agregar tabla de markdown, solo mostrar la tabla estructurada HTML
                     recommendations = self._generate_general_recommendations(valuations)
                     data = [self._valuation_to_dict(v) for v in valuations]
-                # Si hay múltiples resultados (más de 1), generar preguntas de refinamiento
-                # Esto permite que SIRIUS interactúe con el usuario para acotar la búsqueda
-                elif len(valuations) > 1:
-                    logger.info(f"Hay {len(valuations)} resultados, generando preguntas de refinamiento...")
-                    refinement_questions = self._generate_refinement_questions(valuations, query, extracted)
-                    if refinement_questions:
-                        answer = f"Se encontraron {len(valuations)} títulos que coinciden con tu búsqueda. Para acotar los resultados y darte la información precisa, necesito más detalles:\n\n"
-                        answer += "\n".join(f"• {q}" for q in refinement_questions)
-                        answer += "\n\nPor favor, proporciona alguna de estas características para ayudarte mejor."
-                        recommendations = [
-                            "Proporciona el ISIN específico si lo conoces",
-                            "Indica el emisor o banco emisor",
-                            "Especifica la fecha de vencimiento exacta",
-                            "Menciona el tipo de instrumento si lo sabes",
-                            "Puedes decir 'muestrame esos X titulos' para ver todos los resultados"
-                        ]
-                        data = None
-                    else:
-                        # Si no se pueden generar preguntas, mostrar resultados limitados
-                        answer = f"Se encontraron {len(valuations)} valoraciones. Mostrando las primeras 5:\n\n"
-                        answer += self.format_valuation_table(valuations[:5])
-                        if len(valuations) > 5:
-                            answer += f"\n\n💡 Para ver todos los resultados o acotar la búsqueda, proporciona más detalles como el ISIN específico, emisor o fecha de vencimiento."
-                        recommendations = self._generate_general_recommendations(valuations[:5])
-                        data = [self._valuation_to_dict(v) for v in valuations[:5]]
-                
-                elif not valuations:
-                    # Determinar tipo de búsqueda para mensaje de error apropiado
-                    is_busqueda_nemotecnico = (query.emisor and query.tipo_instrumento and 
-                                             query.emisor == query.tipo_instrumento and not query.isin)
                     
-                    if is_busqueda_nemotecnico:
+                    # Retornar respuesta de múltiples ISINs directamente
+                    return {
+                        "answer": answer,
+                        "recommendations": recommendations,
+                        "data": data,
+                        "metadata": {
+                            "intent": "multiples_isins",
+                            "query_params": self.last_query_params
+                        }
+                    }
+                
+                else:
+                    # Consulta simple
+                    # NUEVA LÓGICA: Búsqueda incremental tipo Excel si no es por ISIN
+                    is_busqueda_por_caracteristicas = (
+                        not query.isin and 
+                        not query.isins and
+                        (query.emisor or query.tipo_instrumento or query.fecha_vencimiento or query.cupon is not None)
+                    )
+                    
+                    if is_busqueda_por_caracteristicas:
+                        logger.info("🔍 Búsqueda por características detectada - aplicando filtrado incremental tipo Excel")
+                        valuations = self._incremental_search_by_characteristics(query, extracted)
+                        
+                        # IMPORTANTE: Guardar query y resultados para contexto de conversación
+                        # Esto permite que el usuario refina la búsqueda en mensajes posteriores
+                        tiene_filtros_validos = (
+                            query.emisor or 
+                            query.tipo_instrumento or 
+                            query.fecha_vencimiento or 
+                            query.cupon is not None or
+                            query.proveedor
+                        )
+                        
+                        if tiene_filtros_validos:
+                            self.last_query = query
+                            self.last_results = valuations
+                            self.last_query_params = {
+                                "isin": query.isin,
+                                "emisor": query.emisor,
+                                "tipo_instrumento": query.tipo_instrumento,
+                                "fecha_vencimiento": query.fecha_vencimiento.isoformat() if query.fecha_vencimiento else None,
+                                "cupon": query.cupon
+                            }
+                            logger.info(f"✅ Contexto guardado para refinamiento: {len(valuations)} resultados con filtros: {tiene_filtros_validos}")
+                    else:
+                        logger.info(f"Ejecutando consulta: isin={query.isin}, emisor={query.emisor}, tipo_instrumento={query.tipo_instrumento}, fecha_vencimiento={query.fecha_vencimiento}, cupon={query.cupon}")
+                        logger.info(f"Query completo: {query}")
+                        valuations = self.query_service.query_valuations(query, self.supabase_access_token)
+                        logger.info(f"Consulta completada: se encontraron {len(valuations)} valoraciones después de aplicar todos los filtros")
+                
+                # Log adicional para debugging
+                if len(valuations) == 0:
+                    logger.warning(f"NO se encontraron valoraciones para: emisor={query.emisor}, tipo_instrumento={query.tipo_instrumento}, fecha_vencimiento={query.fecha_vencimiento}, cupon={query.cupon}")
+                    # Verificar si la consulta tiene todos los parámetros necesarios
+                    if query.emisor and query.tipo_instrumento:
+                        logger.info(f"Es búsqueda por nemotécnico: {query.emisor}")
+                    if query.fecha_vencimiento:
+                        logger.info(f"Con filtro de fecha de vencimiento: {query.fecha_vencimiento}")
+                
+                # Guardar consulta y resultados para contexto de conversación
+                # IMPORTANTE: Solo guardar resultados si la consulta tiene filtros válidos
+                # Si la consulta no tiene filtros (sin emisor, sin isin, sin fecha_vencimiento, etc.), 
+                # no guardar todos los resultados para evitar que se muestren todos cuando el usuario pide mostrar
+                tiene_filtros_validos = (
+                    query.isin or 
+                    query.isins or 
+                    (query.emisor and query.tipo_instrumento) or 
+                    query.fecha_vencimiento or 
+                    query.cupon is not None or
+                    query.proveedor
+                )
+                
+                # IMPORTANTE: Si hay 1 valoración y no se especificó proveedor, buscar también en el otro proveedor
+                # ANTES de guardar resultados para contexto
+                if len(valuations) == 1 and not query.proveedor:
+                    valuation_encontrada = valuations[0]
+                    isin_encontrado = valuation_encontrada.isin if hasattr(valuation_encontrada, "isin") else self._get_valuation_field(valuation_encontrada, "isin")
+                    proveedor_encontrado = valuation_encontrada.proveedor if hasattr(valuation_encontrada, "proveedor") else self._get_valuation_field(valuation_encontrada, "proveedor")
+                    
+                    # Determinar el otro proveedor
+                    from models import Provider
+                    otro_proveedor = Provider.PIP_LATAM if (proveedor_encontrado == Provider.PRECIA or (isinstance(proveedor_encontrado, str) and "PRECIA" in str(proveedor_encontrado))) else Provider.PRECIA
+                    
+                    # Si hay un ISIN, buscar en el otro proveedor también
+                    if isin_encontrado:
+                        logger.info(f"Se encontró 1 valoración de {proveedor_encontrado}. Verificando si hay valoración del otro proveedor ({otro_proveedor.value}) para ISIN {isin_encontrado}...")
+                        # Crear una nueva query para buscar en el otro proveedor usando el ISIN encontrado
+                        query_otro_proveedor = ValuationQuery(
+                            isin=isin_encontrado,
+                            proveedor=otro_proveedor,
+                            fecha=query.fecha,
+                            fecha_vencimiento=query.fecha_vencimiento,
+                            cupon=query.cupon
+                        )
+                        otras_valuations = self.query_service.query_valuations(query_otro_proveedor, self.supabase_access_token)
+                        if otras_valuations:
+                            logger.info(f"✅ Se encontró {len(otras_valuations)} valoración(es) adicional(es) del otro proveedor ({otro_proveedor.value}).")
+                            # Agregar las otras valoraciones a la lista
+                            valuations.extend(otras_valuations)
+                            logger.info(f"Total de valoraciones: {len(valuations)} (de {len(set(v.proveedor if hasattr(v, 'proveedor') else self._get_valuation_field(v, 'proveedor') for v in valuations))} proveedores)")
+                        else:
+                            logger.info(f"No se encontró valoración del otro proveedor ({otro_proveedor.value}) para ISIN {isin_encontrado}.")
+                
+                # Guardar consulta y resultados para contexto de conversación
+                if tiene_filtros_validos:
+                    self.last_query = query
+                    self.last_results = valuations  # Ahora incluye todas las valoraciones (ambos proveedores si existen)
+                    self.last_query_params = {
+                        "isin": query.isin,
+                        "emisor": query.emisor,
+                        "tipo_instrumento": query.tipo_instrumento,
+                        "fecha_vencimiento": query.fecha_vencimiento.isoformat() if query.fecha_vencimiento else None,
+                        "cupon": query.cupon
+                    }
+                    logger.info(f"Resultados guardados para contexto: {len(valuations)} valoraciones con filtros válidos")
+                else:
+                    logger.warning(f"Consulta sin filtros válidos detectada. No se guardarán resultados para evitar mostrar todos los títulos.")
+                    # No guardar resultados si no hay filtros válidos
+                    # Esto evita que cuando el usuario pida mostrar, se muestren todos los resultados
+            
+            # Procesar resultados (tanto si se filtraron sobre last_results como si se ejecutó consulta normal)
+            # Si se filtró sobre last_results, valuations ya está definido
+            # Si se ejecutó consulta normal, valuations también está definido
+            
+            # Si es una acción de "mostrar", mostrar todos los resultados directamente
+            if es_accion_mostrar and valuations:
+                answer = f"Se encontraron {len(valuations)} títulos que coinciden con tu búsqueda:\n\n"
+                # No agregar tabla de markdown, solo mostrar la tabla estructurada HTML
+                recommendations = self._generate_general_recommendations(valuations)
+                data = [self._valuation_to_dict(v) for v in valuations]
+            # Si hay múltiples resultados (más de 1), generar preguntas de refinamiento
+            # Esto permite que SIRIUS interactúe con el usuario para acotar la búsqueda
+            elif len(valuations) > 1:
+                    # Contar títulos únicos por ISIN para mostrar el número correcto
+                    # IMPORTANTE: Usar helper _get_valuation_field para manejar objetos y diccionarios
+                    # IMPORTANTE: Todos los ISINs únicos deben contarse, sin importar si están en uno o ambos proveedores
+                    isins_unicos = set()
+                    for v in valuations:
+                        isin = self._get_valuation_field(v, "isin")
+                        if isin:
+                            isins_unicos.add(isin)
+                    num_titulos = len(isins_unicos)
+                    
+                    # Verificar si hay ISINs que solo están en un proveedor
+                    isins_por_proveedor = {}
+                    for v in valuations:
+                        isin = self._get_valuation_field(v, "isin")
+                        if isin:
+                            prov = v.proveedor if hasattr(v, "proveedor") else self._get_valuation_field(v, "proveedor")
+                            prov_str = prov.value if hasattr(prov, 'value') else str(prov)
+                            if isin not in isins_por_proveedor:
+                                isins_por_proveedor[isin] = set()
+                            isins_por_proveedor[isin].add(prov_str)
+                    
+                    isins_solo_un_proveedor = [isin for isin, provs in isins_por_proveedor.items() if len(provs) == 1]
+                    if isins_solo_un_proveedor:
+                        logger.info(f"📌 ISINs que solo están en un proveedor: {sorted(isins_solo_un_proveedor)}")
+                    
+                    logger.info(f"📊 Conteo de títulos únicos: {num_titulos} títulos (ISINs: {sorted(isins_unicos)}) de {len(valuations)} valoraciones totales")
+                    logger.info(f"✅ Todos los ISINs únicos se incluyen en el conteo, incluso si solo están en un proveedor")
+                    
+                    # IMPORTANTE: Si hay un solo título pero múltiples valoraciones (ej: de ambos proveedores),
+                    # mostrar TODAS las valoraciones directamente, no generar preguntas de refinamiento
+                    if num_titulos == 1:
+                        logger.info(f"Se encontró 1 título con {len(valuations)} valoraciones (probablemente de ambos proveedores). Mostrando todas las valoraciones.")
+                        # Verificar si hay valoraciones de ambos proveedores
+                        proveedores = set()
+                        for v in valuations:
+                            prov = v.proveedor if hasattr(v, "proveedor") else self._get_valuation_field(v, "proveedor")
+                            if prov:
+                                proveedores.add(prov)
+                        
+                        if len(proveedores) > 1:
+                            answer = f"Se encontró 1 título con valoraciones de {len(proveedores)} proveedores:\n\n"
+                        else:
+                            answer = f"Se encontró 1 título con {len(valuations)} valoraciones:\n\n"
+                        # No agregar tabla de markdown, solo mostrar la tabla estructurada HTML
+                        recommendations = self._generate_general_recommendations(valuations)
+                        data = [self._valuation_to_dict(v) for v in valuations]
+                    else:
+                        # Múltiples títulos, generar preguntas de refinamiento
+                        logger.info(f"Hay {num_titulos} títulos ({len(valuations)} valoraciones), generando preguntas de refinamiento...")
+                        refinement_questions = self._generate_refinement_questions(valuations, query, extracted)
+                        if refinement_questions:
+                            answer = f"Se encontraron {num_titulos} títulos que coinciden con tu búsqueda. Para acotar los resultados y darte la información precisa, necesito más detalles:\n\n"
+                            answer += "\n".join(f"• {q}" for q in refinement_questions)
+                            answer += "\n\nPor favor, proporciona alguna de estas características para ayudarte mejor."
+                            recommendations = [
+                                "Proporciona el ISIN específico si lo conoces",
+                                "Indica el emisor o banco emisor",
+                                "Especifica la fecha de vencimiento exacta",
+                                "Menciona la tasa facial o cupón del título",
+                                "Puedes decir 'muestrame esos X titulos' para ver todos los resultados"
+                            ]
+                            data = None
+                        else:
+                            # Si no se pueden generar preguntas, mostrar resultados limitados
+                            answer = f"Se encontraron {num_titulos} título(s) que coinciden con tu búsqueda. Mostrando las primeras 5 valoraciones:\n\n"
+                            answer += self.format_valuation_table(valuations[:5])
+                            if len(valuations) > 5:
+                                answer += f"\n\n💡 Para ver todos los resultados o acotar la búsqueda, proporciona más detalles como el ISIN específico, emisor, fecha de vencimiento o tasa facial/cupón."
+                            recommendations = self._generate_general_recommendations(valuations[:5])
+                            data = [self._valuation_to_dict(v) for v in valuations[:5]]
+            
+            elif len(valuations) == 1:
+                # Hay exactamente 1 valoración
+                # IMPORTANTE: Si hay 1 valoración, verificar si hay otra del otro proveedor
+                # Buscar la otra valoración usando el ISIN encontrado
+                valuation_encontrada = valuations[0]
+                isin_encontrado = valuation_encontrada.isin if hasattr(valuation_encontrada, "isin") else self._get_valuation_field(valuation_encontrada, "isin")
+                proveedor_encontrado = valuation_encontrada.proveedor if hasattr(valuation_encontrada, "proveedor") else self._get_valuation_field(valuation_encontrada, "proveedor")
+                
+                # Determinar el otro proveedor
+                otro_proveedor = Provider.PIP_LATAM if proveedor_encontrado == Provider.PRECIA else Provider.PRECIA
+                
+                # IMPORTANTE: Si hay un ISIN y no se especificó un proveedor, buscar en el otro proveedor también
+                # Esto asegura que se muestren valoraciones de ambos proveedores cuando existen
+                if isin_encontrado and not query.proveedor:
+                    logger.info(f"Se encontró 1 valoración de {proveedor_encontrado.value if hasattr(proveedor_encontrado, 'value') else proveedor_encontrado}. Verificando si hay valoración del otro proveedor ({otro_proveedor.value}) para ISIN {isin_encontrado}...")
+                    # Crear una nueva query para buscar en el otro proveedor usando el ISIN encontrado
+                    query_otro_proveedor = ValuationQuery(
+                        isin=isin_encontrado,
+                        proveedor=otro_proveedor,
+                        fecha=query.fecha,
+                        fecha_vencimiento=query.fecha_vencimiento,
+                        cupon=query.cupon
+                    )
+                    otras_valuations = self.query_service.query_valuations(query_otro_proveedor, self.supabase_access_token)
+                    if otras_valuations:
+                        logger.info(f"✅ Se encontró {len(otras_valuations)} valoración(es) adicional(es) del otro proveedor ({otro_proveedor.value}).")
+                        # Agregar las otras valoraciones a la lista
+                        valuations.extend(otras_valuations)
+                        # Actualizar last_results con todas las valoraciones
+                        if tiene_filtros_validos:
+                            self.last_results = valuations
+                        logger.info(f"Total de valoraciones: {len(valuations)} (de {len(set(v.proveedor if hasattr(v, 'proveedor') else self._get_valuation_field(v, 'proveedor') for v in valuations))} proveedores)")
+                    else:
+                        logger.info(f"No se encontró valoración del otro proveedor ({otro_proveedor.value}) para ISIN {isin_encontrado}.")
+                
+                # Mostrar todas las valoraciones encontradas
+                if len(valuations) > 1:
+                    # Hay múltiples valoraciones (de ambos proveedores)
+                    proveedores = set()
+                    for v in valuations:
+                        prov = v.proveedor if hasattr(v, "proveedor") else self._get_valuation_field(v, "proveedor")
+                        if prov:
+                            proveedores.add(prov)
+                    answer = f"Se encontró 1 título con valoraciones de {len(proveedores)} proveedores:\n\n"
+                    # No agregar tabla de markdown, solo mostrar la tabla estructurada HTML
+                else:
+                    # Solo hay 1 valoración, usar _format_precise_response
+                    answer = self._format_precise_response(valuations, extracted)
+                
+                recommendations = self._generate_general_recommendations(valuations)
+                data = [self._valuation_to_dict(v) for v in valuations]
+            
+            elif not valuations:
+                # Determinar tipo de búsqueda para mensaje de error apropiado
+                is_busqueda_nemotecnico = (query.emisor and query.tipo_instrumento and 
+                                         query.emisor == query.tipo_instrumento and not query.isin)
+                
+                # Verificar si es un refinamiento que no encontró resultados
+                # IMPORTANTE: Detectar refinamiento sin resultados de manera más robusta
+                # Puede ser refinamiento si se filtró sobre last_results pero no se encontraron resultados
+                # O si hay last_results previos y el query tiene cupón pero no nemotécnico/ISIN nuevo
+                es_refinamiento_sin_resultados = (
+                    (refinamiento_realizado if 'refinamiento_realizado' in locals() else False) or
+                    (
+                        self.last_results and 
+                        len(self.last_results) > 0 and
+                        not query.isin and
+                        not query.isins and
+                        query.cupon is not None
+                    )
+                )
+                
+                if es_refinamiento_sin_resultados:
+                    # El usuario está refinando una búsqueda anterior pero no hay resultados con el nuevo filtro
+                    answer = f"No se encontraron títulos que coincidan con todos los criterios especificados."
+                    if query.cupon:
+                        answer += f"\n\nCriterios aplicados:"
+                        if query.emisor:
+                            answer += f"\n• Nemotécnico: {query.emisor}"
+                        if query.fecha_vencimiento:
+                            answer += f"\n• Fecha de vencimiento: {query.fecha_vencimiento.strftime('%d/%m/%Y')}"
+                        answer += f"\n• Tasa facial/Cupón: {query.cupon}%"
+                    answer += f"\n\nSe encontraron {len(self.last_results)} título(s) con los criterios iniciales, pero ninguno cumple con todos los filtros aplicados."
+                    recommendations = [
+                        "Verificar que la tasa facial/cupón especificada sea correcta",
+                        "Verificar que la fecha de vencimiento sea correcta",
+                        "Revisar si hay alguna diferencia en el formato de los datos",
+                        f"Puedes decir 'muestrame esos {len(self.last_results)} titulos' para ver todos los resultados encontrados inicialmente"
+                    ]
+                    data = None
+                elif is_busqueda_nemotecnico:
                         # Búsqueda por nemotécnico
                         nemotecnico = query.emisor
-                        answer = f"No se encontraron valoraciones para el nemotécnico {nemotecnico}."
-                        if query.fecha_vencimiento:
-                            answer += f" con vencimiento al {query.fecha_vencimiento.strftime('%d/%m/%Y')}"
-                        answer += "."
-                        
-                        recommendations = [
-                            "Verificar que el nemotécnico esté escrito correctamente",
-                            "Confirmar que existe valoración para la fecha solicitada",
-                            "Revisar que el proveedor seleccionado tenga datos disponibles",
-                            "Intentar buscar por ISIN si lo conoces"
-                        ]
+                        # Verificar si el nemotécnico podría ser una palabra común mal interpretada
+                        if nemotecnico.upper() in ['FACIAL', 'CUPON', 'CUPÓN', 'TASA', 'BANCO']:
+                            answer = f"No se encontraron valoraciones. Parece que '{nemotecnico}' podría ser parte de un campo (como 'tasa facial' o 'cupón') en lugar de un nemotécnico."
+                            answer += "\n\nPor favor, proporciona el nemotécnico o ISIN del título que estás buscando."
+                            recommendations = [
+                                "Verificar que hayas proporcionado un nemotécnico válido (código alfanumérico de 6-12 caracteres)",
+                                "Si mencionaste 'tasa facial' o 'cupón', esto es información adicional del título, no el nemotécnico",
+                                "Proporciona el nemotécnico o ISIN del título primero",
+                                "Luego puedes proporcionar características adicionales como tasa facial o fecha de vencimiento"
+                            ]
+                        else:
+                            answer = f"No se encontraron valoraciones para el nemotécnico {nemotecnico}."
+                            if query.fecha_vencimiento:
+                                answer += f" con vencimiento al {query.fecha_vencimiento.strftime('%d/%m/%Y')}"
+                            answer += "."
+                            
+                            recommendations = [
+                                "Verificar que el nemotécnico esté escrito correctamente",
+                                "Confirmar que existe valoración para la fecha solicitada",
+                                "Revisar que el proveedor seleccionado tenga datos disponibles",
+                                "Intentar buscar por ISIN si lo conoces"
+                            ]
                         data = None
-                    elif query.isin:
-                        # Búsqueda por ISIN
-                        # Intentar buscar ISINs similares si no se encontró el exacto
-                        similar_isins = []
-                        if self.supabase_access_token:
-                            try:
-                                from services.supabase_service import SupabaseService
-                                supabase = SupabaseService(access_token=self.supabase_access_token)
-                                
-                                # Buscar ISINs similares (que empiecen con los primeros caracteres)
-                                prefix = query.isin[:6] if len(query.isin) >= 6 else query.isin
-                                for table_name in [supabase.table_pip, supabase.table_precia]:
-                                    try:
-                                        available_columns = supabase._get_available_columns(table_name)
-                                        isin_col = None
-                                        for col in ["ISIN", "isin", "ISIN_CODIGO", "codigo_isin"]:
-                                            if col in available_columns:
-                                                isin_col = col
-                                                break
-                                        
-                                        if isin_col:
-                                            params = {
-                                                "select": isin_col,
-                                                f"{isin_col}": f"like.{prefix}%",
-                                                "limit": "5"
-                                            }
-                                            response = supabase._make_request("GET", table_name, params=params)
-                                            if response:
-                                                for record in response:
-                                                    similar_isin = record.get(isin_col, "")
-                                                    if similar_isin and similar_isin.upper() != query.isin.upper():
-                                                        similar_isins.append(similar_isin)
-                                    except:
-                                        continue
-                            except Exception as e:
-                                logger.warning(f"Error buscando ISINs similares: {str(e)}")
-                        
-                        answer = f"No se encontraron valoraciones para el ISIN {query.isin}."
-                        if similar_isins:
-                            answer += f"\n\nISINs similares encontrados: {', '.join(set(similar_isins[:5]))}"
-                        
-                        recommendations = [
-                            "Verificar que el ISIN esté escrito correctamente",
-                            "Confirmar que existe valoración para la fecha solicitada",
-                            "Revisar que el proveedor seleccionado tenga datos disponibles"
-                        ]
-                        if similar_isins:
-                            recommendations.insert(0, f"Verificar si el ISIN correcto es uno de los similares: {', '.join(set(similar_isins[:3]))}")
-                        data = None
-                    else:
-                        # Búsqueda genérica sin ISIN ni nemotécnico
-                        answer = "No se encontraron valoraciones con los criterios especificados."
-                        recommendations = [
-                            "Proporciona el ISIN o nemotécnico del título",
-                            "Verifica los filtros aplicados (fecha, proveedor, etc.)",
-                            "Confirma que existe valoración para los criterios solicitados"
-                        ]
-                        data = None
+                elif query.isin:
+                    # Búsqueda por ISIN
+                    # Intentar buscar ISINs similares si no se encontró el exacto
+                    similar_isins = []
+                    if self.supabase_access_token:
+                        try:
+                            from services.supabase_service import SupabaseService
+                            supabase = SupabaseService(access_token=self.supabase_access_token)
+                            
+                            # Buscar ISINs similares (que empiecen con los primeros caracteres)
+                            prefix = query.isin[:6] if len(query.isin) >= 6 else query.isin
+                            for table_name in [supabase.table_pip, supabase.table_precia]:
+                                try:
+                                    available_columns = supabase._get_available_columns(table_name)
+                                    isin_col = None
+                                    for col in ["ISIN", "isin", "ISIN_CODIGO", "codigo_isin"]:
+                                        if col in available_columns:
+                                            isin_col = col
+                                            break
+                                    
+                                    if isin_col:
+                                        params = {
+                                            "select": isin_col,
+                                            f"{isin_col}": f"like.{prefix}%",
+                                            "limit": "5"
+                                        }
+                                        response = supabase._make_request("GET", table_name, params=params)
+                                        if response:
+                                            for record in response:
+                                                similar_isin = record.get(isin_col, "")
+                                                if similar_isin and similar_isin.upper() != query.isin.upper():
+                                                    similar_isins.append(similar_isin)
+                                except:
+                                    continue
+                        except Exception as e:
+                            logger.warning(f"Error buscando ISINs similares: {str(e)}")
+                    
+                    answer = f"No se encontraron valoraciones para el ISIN {query.isin}."
+                    if similar_isins:
+                        answer += f"\n\nISINs similares encontrados: {', '.join(set(similar_isins[:5]))}"
+                    
+                    recommendations = [
+                        "Verificar que el ISIN esté escrito correctamente",
+                        "Confirmar que existe valoración para la fecha solicitada",
+                        "Revisar que el proveedor seleccionado tenga datos disponibles"
+                    ]
+                    if similar_isins:
+                        recommendations.insert(0, f"Verificar si el ISIN correcto es uno de los similares: {', '.join(set(similar_isins[:3]))}")
+                    data = None
                 else:
+                    # Búsqueda genérica sin ISIN ni nemotécnico
+                    answer = "No se encontraron valoraciones con los criterios especificados."
+                    recommendations = [
+                        "Proporciona el ISIN o nemotécnico del título",
+                        "Verifica los filtros aplicados (fecha, proveedor, etc.)",
+                        "Confirma que existe valoración para los criterios solicitados"
+                    ]
+                    data = None
+            
+            # Si no hay error y hay resultados, formatear respuesta precisa
+            if 'answer' not in locals() or answer is None:
+                if valuations:
                     # Formatear respuesta precisa
                     answer = self._format_precise_response(valuations, extracted)
                     
@@ -665,7 +1377,10 @@ class ChatService:
             }
             
         except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
             logger.error(f"Error generando respuesta: {str(e)}")
+            logger.error(f"Traceback: {error_trace}")
             return {
                 "answer": f"Error procesando la consulta: {str(e)}",
                 "data": None,
@@ -816,18 +1531,39 @@ class ChatService:
             return "\n".join(lines).strip()
     
     def _valuation_to_dict(self, valuation) -> Dict:
-        """Convierte objeto Valuation a diccionario (excluye campos irrelevantes)"""
+        """Convierte objeto Valuation o diccionario a diccionario (excluye campos irrelevantes)"""
+        # Si ya es un diccionario, retornarlo directamente (pero asegurar formato correcto)
+        if isinstance(valuation, dict):
+            # Ya está en formato diccionario, solo necesitamos asegurar que la fecha esté en formato ISO si es date
+            result = valuation.copy()
+            if "fecha" in result and result["fecha"] and not isinstance(result["fecha"], str):
+                if hasattr(result["fecha"], "isoformat"):
+                    result["fecha"] = result["fecha"].isoformat()
+                else:
+                    result["fecha"] = str(result["fecha"])
+            # Asegurar que proveedor esté en formato correcto
+            if "proveedor" in result:
+                if isinstance(result["proveedor"], dict):
+                    result["proveedor"] = result["proveedor"].get("value", str(result["proveedor"]))
+                elif hasattr(result["proveedor"], "value"):
+                    result["proveedor"] = result["proveedor"].value
+            return result
+        
+        # Si es un objeto Valuation, convertirlo a diccionario
+        # IMPORTANTE: Para tasa (TIR), preservar todos los decimales tal como están en la base
+        # Enviar como número (no string) para que JavaScript pueda formatearlo correctamente
+        # La precisión se preservará en la serialización JSON
         return {
             "isin": valuation.isin,
             "emisor": valuation.emisor,
             "tipo_instrumento": valuation.tipo_instrumento,
             "precio_limpio": valuation.precio_limpio,
             "precio_sucio": valuation.precio_sucio,
-            "tasa": valuation.tasa,
+            "tasa": valuation.tasa,  # Mantener como float para preservar precisión
             "duracion": valuation.duracion,
             # Excluidos: convexidad (no presenta información) y archivo_origen (irrelevante)
             "fecha": valuation.fecha.isoformat() if valuation.fecha else None,
-            "proveedor": valuation.proveedor.value
+            "proveedor": valuation.proveedor.value if hasattr(valuation.proveedor, "value") else str(valuation.proveedor)
         }
     
     def _generate_comparison_recommendations(self, comparison: Dict) -> List[str]:
@@ -887,11 +1623,25 @@ class ChatService:
             recommendations.append("Revisar archivos de ingesta recientes")
             recommendations.append("Confirmar que los ISINs existen en la base de datos")
         else:
-            providers = set(v.proveedor for v in valuations)
-            if len(providers) == 1:
-                recommendations.append(f"Solo hay datos de {list(providers)[0].value} → Considerar ingesta del otro proveedor para comparación")
+            # Usar helper para acceder a campos (funciona con objetos y diccionarios)
+            providers = set()
+            for v in valuations:
+                proveedor = self._get_valuation_field(v, "proveedor")
+                if isinstance(proveedor, dict):
+                    proveedor_val = proveedor.get("value", str(proveedor))
+                elif hasattr(proveedor, "value"):
+                    proveedor_val = proveedor.value
+                else:
+                    proveedor_val = str(proveedor) if proveedor else None
+                if proveedor_val:
+                    providers.add(proveedor_val)
             
-            dates = set(v.fecha for v in valuations)
+            if len(providers) == 1:
+                provider_name = list(providers)[0]
+                recommendations.append(f"Solo hay datos de {provider_name} → Considerar ingesta del otro proveedor para comparación")
+            
+            dates = set(self._get_valuation_field(v, "fecha") for v in valuations)
+            dates = {d for d in dates if d is not None}
             if len(dates) > 1:
                 recommendations.append(f"Valoraciones de múltiples fechas → Verificar que se está usando la fecha correcta")
             
@@ -899,9 +1649,267 @@ class ChatService:
         
         return recommendations[:3]
     
+    def _incremental_search_by_characteristics(self, query: ValuationQuery, extracted: Dict) -> List:
+        """
+        Búsqueda incremental tipo Excel: filtra paso a paso por características
+        Prioriza: nemotécnico > fecha de vencimiento > tasa facial/cupón > otras características
+        
+        Args:
+            query: Query con los filtros disponibles
+            extracted: Parámetros extraídos del mensaje
+        
+        Returns:
+            Lista de valoraciones encontradas después del filtrado incremental
+        """
+        logger.info("📊 Iniciando búsqueda incremental tipo Excel...")
+        
+        # Paso 1: Priorizar nemotécnico si está disponible
+        filtros_aplicados = []
+        resultados_intermedios = []
+        
+        # Detectar si hay nemotécnico
+        is_nemotecnico = (query.emisor and query.tipo_instrumento and 
+                         query.emisor == query.tipo_instrumento)
+        
+        if is_nemotecnico:
+            logger.info(f"🔹 Paso 1: Filtrando por nemotécnico: {query.emisor}")
+            # Crear query con nemotécnico y fecha de vencimiento si está disponible
+            # IMPORTANTE: Incluir fecha de vencimiento desde el inicio para obtener todos los resultados correctos
+            query_nemotecnico = ValuationQuery(
+                emisor=query.emisor,
+                tipo_instrumento=query.tipo_instrumento,
+                proveedor=query.proveedor,
+                fecha=query.fecha,
+                fecha_vencimiento=query.fecha_vencimiento  # Incluir fecha de vencimiento desde el inicio
+            )
+            resultados_intermedios = self.query_service.query_valuations(
+                query_nemotecnico, 
+                self.supabase_access_token
+            )
+            filtros_aplicados.append(f"nemotécnico: {query.emisor}")
+            if query.fecha_vencimiento:
+                filtros_aplicados.append(f"fecha de vencimiento: {query.fecha_vencimiento.strftime('%d/%m/%Y')}")
+            logger.info(f"   ✅ Después de nemotécnico{' + fecha de vencimiento' if query.fecha_vencimiento else ''}: {len(resultados_intermedios)} resultados")
+            
+            # Contar ISINs únicos encontrados
+            isins_unicos = set()
+            for v in resultados_intermedios:
+                isin = self._get_valuation_field(v, "isin")
+                if isin:
+                    isins_unicos.add(isin)
+            logger.info(f"   📋 ISINs únicos encontrados: {len(isins_unicos)} → {sorted(isins_unicos)}")
+            
+            # Si no hay resultados con nemotécnico, retornar vacío
+            if len(resultados_intermedios) == 0:
+                logger.info("   ❌ No se encontraron resultados con nemotécnico")
+                return []
+        else:
+            # Si no hay nemotécnico, buscar por las características disponibles
+            # Priorizar: fecha de vencimiento > tasa facial/cupón > otras
+            logger.info("🔹 Paso 1: No hay nemotécnico, buscando por otras características disponibles...")
+            
+            # Crear query inicial con las características más restrictivas primero
+            query_inicial = ValuationQuery(
+                proveedor=query.proveedor,
+                fecha=query.fecha
+            )
+            
+            # Si hay fecha de vencimiento, incluirla desde el inicio (es muy específica)
+            if query.fecha_vencimiento:
+                query_inicial.fecha_vencimiento = query.fecha_vencimiento
+                logger.info(f"   🔍 Aplicando filtro inicial por fecha de vencimiento: {query.fecha_vencimiento}")
+            
+            resultados_intermedios = self.query_service.query_valuations(
+                query_inicial,
+                self.supabase_access_token
+            )
+            logger.info(f"   ✅ Resultados iniciales: {len(resultados_intermedios)} resultados")
+            
+            # Si no hay resultados con los filtros iniciales, retornar vacío
+            if len(resultados_intermedios) == 0:
+                logger.info("   ❌ No se encontraron resultados con los filtros iniciales")
+                return []
+        
+        # Paso 2: Filtrar por fecha de vencimiento si está disponible (y no se aplicó en paso 1)
+        if query.fecha_vencimiento and len(resultados_intermedios) > 1:
+            # Verificar si ya se aplicó este filtro (cuando no hay nemotécnico)
+            if f"fecha de vencimiento: {query.fecha_vencimiento.strftime('%d/%m/%Y')}" not in filtros_aplicados:
+                logger.info(f"🔹 Paso 2: Filtrando por fecha de vencimiento: {query.fecha_vencimiento}")
+                resultados_antes = len(resultados_intermedios)
+                resultados_intermedios = self._filter_by_fecha_vencimiento(
+                    resultados_intermedios, 
+                    query.fecha_vencimiento
+                )
+                filtros_aplicados.append(f"fecha de vencimiento: {query.fecha_vencimiento.strftime('%d/%m/%Y')}")
+                logger.info(f"   ✅ Después de fecha de vencimiento: {resultados_antes} → {len(resultados_intermedios)} resultados")
+        
+        # Paso 3: Filtrar por tasa facial/cupón si está disponible
+        if query.cupon is not None and len(resultados_intermedios) > 1:
+            logger.info(f"🔹 Paso 3: Filtrando por tasa facial/cupón: {query.cupon}%")
+            resultados_antes = len(resultados_intermedios)
+            resultados_intermedios = self._filter_by_cupon(
+                resultados_intermedios,
+                query.cupon
+            )
+            filtros_aplicados.append(f"tasa facial/cupón: {query.cupon}%")
+            logger.info(f"   ✅ Después de tasa facial/cupón: {resultados_antes} → {len(resultados_intermedios)} resultados")
+        
+        # Paso 4: Filtrar por proveedor si está disponible
+        if query.proveedor and len(resultados_intermedios) > 1:
+            logger.info(f"🔹 Paso 4: Filtrando por proveedor: {query.proveedor.value}")
+            resultados_antes = len(resultados_intermedios)
+            resultados_intermedios = [
+                v for v in resultados_intermedios
+                if self._get_valuation_field(v, "proveedor") == query.proveedor
+            ]
+            filtros_aplicados.append(f"proveedor: {query.proveedor.value}")
+            logger.info(f"   ✅ Después de proveedor: {resultados_antes} → {len(resultados_intermedios)} resultados")
+        
+        logger.info(f"📊 Búsqueda incremental completada. Filtros aplicados: {', '.join(filtros_aplicados)}")
+        logger.info(f"   📈 Resultados finales: {len(resultados_intermedios)} valoraciones")
+        
+        # Log final: contar ISINs únicos encontrados
+        isins_finales = set()
+        for v in resultados_intermedios:
+            isin = self._get_valuation_field(v, "isin")
+            if isin:
+                isins_finales.add(isin)
+        logger.info(f"   📋 ISINs únicos encontrados después de búsqueda incremental: {len(isins_finales)} → {sorted(isins_finales)}")
+        
+        return resultados_intermedios
+    
+    def _filter_by_fecha_vencimiento(self, valuations: List, fecha_vencimiento) -> List:
+        """
+        Filtra valoraciones por fecha de vencimiento con coincidencia exacta
+        
+        IMPORTANTE: Cuando el usuario especifica una fecha exacta, debe coincidir exactamente.
+        La tolerancia de 1 día solo se aplica en query_service para casos de parsing,
+        pero aquí requerimos coincidencia exacta para mantener precisión en la búsqueda.
+        """
+        resultados_filtrados = []
+        
+        # Asegurar que fecha_vencimiento sea un objeto date
+        from datetime import date, datetime
+        if isinstance(fecha_vencimiento, str):
+            try:
+                fecha_vencimiento = datetime.fromisoformat(fecha_vencimiento).date()
+            except:
+                try:
+                    import re
+                    match = re.match(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', fecha_vencimiento)
+                    if match:
+                        dia, mes, año = match.groups()
+                        fecha_vencimiento = date(int(año), int(mes), int(dia))
+                    else:
+                        logger.warning(f"No se pudo parsear fecha de vencimiento para filtrar: {fecha_vencimiento}")
+                        return resultados_filtrados
+                except Exception as e:
+                    logger.warning(f"Error parseando fecha de vencimiento: {str(e)}")
+                    return resultados_filtrados
+        elif hasattr(fecha_vencimiento, 'date'):
+            fecha_vencimiento = fecha_vencimiento.date()
+        
+        for v in valuations:
+            fecha_v = self._get_valuation_field(v, "fecha_vencimiento")
+            if fecha_v:
+                # Convertir a date si es necesario
+                if isinstance(fecha_v, str):
+                    try:
+                        fecha_v = datetime.fromisoformat(fecha_v).date()
+                    except:
+                        try:
+                            import re
+                            match = re.match(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', fecha_v)
+                            if match:
+                                dia, mes, año = match.groups()
+                                fecha_v = date(int(año), int(mes), int(dia))
+                            else:
+                                continue
+                        except:
+                            continue
+                elif hasattr(fecha_v, 'date'):
+                    fecha_v = fecha_v.date()
+                
+                # Coincidencia exacta (sin tolerancia) cuando el usuario especifica fecha exacta
+                if fecha_v == fecha_vencimiento:
+                    resultados_filtrados.append(v)
+                else:
+                    # Log para debugging: registrar qué fechas no coinciden
+                    diferencia = abs((fecha_v - fecha_vencimiento).days) if fecha_v and fecha_vencimiento else None
+                    if diferencia and diferencia <= 2:  # Solo loggear si la diferencia es pequeña
+                        logger.debug(f"Fecha de vencimiento no coincide: {fecha_v} vs {fecha_vencimiento} (diferencia: {diferencia} días) - ISIN: {self._get_valuation_field(v, 'isin')}")
+        
+        logger.info(f"🔍 Filtro de fecha de vencimiento {fecha_vencimiento}: {len(valuations)} → {len(resultados_filtrados)} valoraciones")
+        return resultados_filtrados
+    
+    def _filter_by_cupon(self, valuations: List, cupon: float) -> List:
+        """Filtra valoraciones por cupón/tasa facial con tolerancia de 0.01%"""
+        cupon_min = cupon - 0.01
+        cupon_max = cupon + 0.01
+        resultados_filtrados = []
+        
+        for v in valuations:
+            cupon_val = self._get_valuation_field(v, "cupon")
+            if cupon_val is not None and cupon_min <= cupon_val <= cupon_max:
+                resultados_filtrados.append(v)
+        
+        return resultados_filtrados
+    
+    def _analyze_available_characteristics(self, valuations: List, query: ValuationQuery) -> Dict:
+        """
+        Analiza qué características están disponibles en los resultados pero no se han usado como filtro
+        Esto ayuda a identificar qué preguntar para reducir mejor los resultados
+        
+        Returns:
+            Diccionario con información sobre características disponibles y su diversidad
+        """
+        caracteristicas = {
+            "isins": set(),
+            "fechas_vencimiento": set(),
+            "cupones": set(),
+            "emisores": set(),
+            "proveedores": set()
+        }
+        
+        for v in valuations:
+            isin = self._get_valuation_field(v, "isin")
+            fecha_v = self._get_valuation_field(v, "fecha_vencimiento")
+            cupon = self._get_valuation_field(v, "cupon")
+            emisor = self._get_valuation_field(v, "emisor")
+            proveedor = self._get_valuation_field(v, "proveedor")
+            
+            if isin:
+                caracteristicas["isins"].add(isin)
+            if fecha_v:
+                caracteristicas["fechas_vencimiento"].add(fecha_v)
+            if cupon is not None:
+                caracteristicas["cupones"].add(cupon)
+            if emisor:
+                caracteristicas["emisores"].add(emisor)
+            if proveedor:
+                if hasattr(proveedor, "value"):
+                    caracteristicas["proveedores"].add(proveedor.value)
+                else:
+                    caracteristicas["proveedores"].add(str(proveedor))
+        
+        # Identificar qué características NO se han usado como filtro pero están disponibles
+        faltantes = {
+            "isin_disponible": len(caracteristicas["isins"]) > 1 and not query.isin,
+            "fecha_vencimiento_disponible": len(caracteristicas["fechas_vencimiento"]) > 1 and not query.fecha_vencimiento,
+            "cupon_disponible": len(caracteristicas["cupones"]) > 1 and query.cupon is None,
+            "emisor_disponible": len(caracteristicas["emisores"]) > 1 and not query.emisor,
+            "proveedor_disponible": len(caracteristicas["proveedores"]) > 1 and not query.proveedor
+        }
+        
+        return {
+            "caracteristicas": caracteristicas,
+            "faltantes": faltantes
+        }
+    
     def _generate_refinement_questions(self, valuations: List, query: ValuationQuery, extracted: Dict) -> List[str]:
         """
         Genera preguntas de refinamiento cuando hay demasiados resultados
+        Basado en las características que faltan y que pueden ayudar a reducir los resultados
         
         Args:
             valuations: Lista de valoraciones encontradas
@@ -909,96 +1917,94 @@ class ChatService:
             extracted: Parámetros extraídos del mensaje
         
         Returns:
-            Lista de preguntas para refinar la búsqueda
+            Lista de preguntas para refinar la búsqueda, priorizadas por efectividad
         """
         questions = []
         message_lower = extracted.get("_original_message", "").lower()
         
+        # Analizar qué características están disponibles en los resultados pero no se han usado como filtro
+        # Esto ayuda a identificar qué preguntar para reducir mejor los resultados
+        caracteristicas_disponibles = self._analyze_available_characteristics(valuations, query)
+        
         # Analizar qué información falta para acotar
-        unique_isins = set(v.isin for v in valuations if v.isin)
-        unique_emisores = set(v.emisor for v in valuations if v.emisor)
-        unique_fechas_vencimiento = set(v.fecha_vencimiento for v in valuations if v.fecha_vencimiento)
-        unique_tipos = set(v.tipo_instrumento for v in valuations if v.tipo_instrumento)
+        # Usar helper para acceder a campos (funciona con objetos y diccionarios)
+        unique_isins = set(self._get_valuation_field(v, "isin") for v in valuations if self._get_valuation_field(v, "isin"))
+        unique_emisores = set(self._get_valuation_field(v, "emisor") for v in valuations if self._get_valuation_field(v, "emisor"))
+        unique_fechas_vencimiento = set(self._get_valuation_field(v, "fecha_vencimiento") for v in valuations if self._get_valuation_field(v, "fecha_vencimiento"))
+        unique_tipos = set(self._get_valuation_field(v, "tipo_instrumento") for v in valuations if self._get_valuation_field(v, "tipo_instrumento"))
         
         # Detectar si es búsqueda por nemotécnico
         is_nemotecnico_search = (query.emisor and query.tipo_instrumento and 
                                 query.emisor == query.tipo_instrumento and not query.isin)
         
-        # Si es búsqueda por nemotécnico y hay múltiples resultados, priorizar ISIN
-        if is_nemotecnico_search and len(unique_isins) > 1:
+        # PRIORIDAD 1: Si es búsqueda por nemotécnico y hay múltiples resultados, priorizar ISIN
+        if is_nemotecnico_search and caracteristicas_disponibles["faltantes"]["isin_disponible"]:
             if "isin" not in message_lower and "código" not in message_lower and "codigo" not in message_lower:
                 # Mostrar algunos ISINs como opciones
-                isins_sample = list(unique_isins)[:3]
+                isins_sample = list(caracteristicas_disponibles["caracteristicas"]["isins"])[:3]
                 isins_str = ", ".join(str(i) for i in isins_sample if i)
-                if len(unique_isins) > 3:
-                    isins_str += f" u otro (hay {len(unique_isins)} títulos diferentes)"
+                if len(caracteristicas_disponibles["caracteristicas"]["isins"]) > 3:
+                    isins_str += f" u otro (hay {len(caracteristicas_disponibles['caracteristicas']['isins'])} títulos diferentes)"
                 if isins_str:
                     questions.append(f"¿Cuál es el código ISIN del título? Por ejemplo: {isins_str}")
         
-        # Si no hay ISIN en la consulta y hay múltiples ISINs (caso general)
-        elif not query.isin and len(unique_isins) > 1:
+        # PRIORIDAD 2: Fecha de vencimiento si no se ha usado como filtro y está disponible
+        elif caracteristicas_disponibles["faltantes"]["fecha_vencimiento_disponible"]:
+            if "vencimiento" not in message_lower and "vencen" not in message_lower:
+                fechas_sample = sorted(list(caracteristicas_disponibles["caracteristicas"]["fechas_vencimiento"]))[:3]
+                if fechas_sample:
+                    fechas_str = ", ".join(f.strftime("%d/%m/%Y") for f in fechas_sample)
+                    questions.append(f"¿Cuál es la fecha de vencimiento exacta? Por ejemplo: {fechas_str}")
+        
+        # PRIORIDAD 3: Tasa facial/cupón si no se ha usado como filtro y está disponible
+        elif caracteristicas_disponibles["faltantes"]["cupon_disponible"]:
+            if "cupon" not in message_lower and "tasa facial" not in message_lower and "cupón" not in message_lower:
+                cupones_sample = sorted(list(caracteristicas_disponibles["caracteristicas"]["cupones"]))[:3]
+                if cupones_sample:
+                    cupones_str = ", ".join(f"{c:.2f}%" for c in cupones_sample)
+                    questions.append(f"¿Cuál es la tasa facial o cupón del título? Por ejemplo: {cupones_str}")
+        
+        # PRIORIDAD 4: Si no hay ISIN en la consulta y hay múltiples ISINs (caso general)
+        elif not query.isin and caracteristicas_disponibles["faltantes"]["isin_disponible"]:
             if "isin" not in message_lower and "código" not in message_lower and "codigo" not in message_lower:
                 questions.append("¿Cuál es el código ISIN del título?")
         
-        # Si hay múltiples fechas de vencimiento y se mencionó vencimiento
-        if ("vencimiento" in message_lower or "vencen" in message_lower) and len(unique_fechas_vencimiento) > 1:
-            # Verificar si se mencionó una fecha específica en el mensaje
-            fecha_especifica_en_query = query.fecha_vencimiento is not None
+        # Si aún no hay preguntas, usar características disponibles para generar preguntas inteligentes
+        if not questions:
+            # PRIORIDAD 5: Emisor si está disponible y puede ayudar
+            if caracteristicas_disponibles["faltantes"]["emisor_disponible"]:
+                if "emisor" not in message_lower and "banco" not in message_lower:
+                    emisores_sample = list(caracteristicas_disponibles["caracteristicas"]["emisores"])[:3]
+                    emisores_str = ", ".join(str(e) for e in emisores_sample if e)
+                    if len(caracteristicas_disponibles["caracteristicas"]["emisores"]) > 3:
+                        emisores_str += f" u otro (hay {len(caracteristicas_disponibles['caracteristicas']['emisores'])} emisores diferentes)"
+                    if emisores_str:
+                        questions.append(f"¿Cuál es el emisor? Por ejemplo: {emisores_str}")
             
-            if not fecha_especifica_en_query:
-                # Buscar fecha en el mensaje original
-                fecha_especifica = False
-                for v in valuations:
-                    if v.fecha_vencimiento:
-                        fecha_str = v.fecha_vencimiento.strftime("%d/%m/%Y")
-                        fecha_str_alt = v.fecha_vencimiento.strftime("%d-%m-%Y")
-                        if fecha_str in message_lower or fecha_str_alt in message_lower:
-                            fecha_especifica = True
-                            break
-                
-                if not fecha_especifica:
-                    fechas_sample = sorted([f for f in unique_fechas_vencimiento if f])[:3]
-                    if fechas_sample:
-                        fechas_str = ", ".join(f.strftime("%d/%m/%Y") for f in fechas_sample)
-                        questions.append(f"¿Cuál es la fecha de vencimiento exacta? Por ejemplo: {fechas_str}")
-        
-        # Si no hay emisor en la consulta y hay múltiples emisores
-        if not query.emisor and len(unique_emisores) > 1:
-            if "emisor" not in message_lower and "banco" not in message_lower:
-                # Mostrar algunos emisores como opciones
-                emisores_sample = list(unique_emisores)[:3]
-                emisores_str = ", ".join(str(e) for e in emisores_sample if e)
-                if len(unique_emisores) > 3:
-                    emisores_str += f" u otro (hay {len(unique_emisores)} emisores diferentes)"
-                if emisores_str:
-                    questions.append(f"¿Cuál es el emisor? Por ejemplo: {emisores_str}")
-        
-        # Si hay múltiples tipos de instrumento
-        if len(unique_tipos) > 1:
-            tipos_list = [t for t in unique_tipos if t]
-            if tipos_list and "tipo" not in message_lower:
-                tipos_str = ", ".join(list(tipos_list)[:3])
-                questions.append(f"¿Qué tipo de instrumento es? Por ejemplo: {tipos_str}")
-        
-        # Si no hay proveedor especificado y hay datos de ambos
-        providers = set(v.proveedor for v in valuations)
-        if not query.proveedor and len(providers) > 1:
-            if "pip" not in message_lower and "precia" not in message_lower:
-                questions.append("¿De qué proveedor necesitas la información? (PIP o Precia)")
+            # PRIORIDAD 6: Proveedor si está disponible
+            elif caracteristicas_disponibles["faltantes"]["proveedor_disponible"]:
+                if "pip" not in message_lower and "precia" not in message_lower:
+                    questions.append("¿De qué proveedor necesitas la información? (PIP o Precia)")
         
         # Si aún no hay preguntas pero hay múltiples resultados, preguntar por cualquier característica distintiva
         if not questions and len(valuations) > 1:
-            if len(unique_isins) > 1:
+            # Usar el análisis de características para determinar qué preguntar
+            if caracteristicas_disponibles["faltantes"]["isin_disponible"]:
                 questions.append("¿Cuál es el código ISIN del título?")
+            elif caracteristicas_disponibles["faltantes"]["fecha_vencimiento_disponible"]:
+                fechas_sample = sorted(list(caracteristicas_disponibles["caracteristicas"]["fechas_vencimiento"]))[:2]
+                if fechas_sample:
+                    fechas_str = ", ".join(f.strftime("%d/%m/%Y") for f in fechas_sample)
+                    questions.append(f"¿Cuál es la fecha de vencimiento? Por ejemplo: {fechas_str}")
+            elif caracteristicas_disponibles["faltantes"]["cupon_disponible"]:
+                cupones_sample = sorted(list(caracteristicas_disponibles["caracteristicas"]["cupones"]))[:2]
+                if cupones_sample:
+                    cupones_str = ", ".join(f"{c:.2f}%" for c in cupones_sample)
+                    questions.append(f"¿Cuál es la tasa facial o cupón? Por ejemplo: {cupones_str}")
             elif len(unique_emisores) > 1:
                 emisores_sample = list(unique_emisores)[:2]
                 if emisores_sample:
                     questions.append(f"¿Cuál es el emisor? Por ejemplo: {', '.join(str(e) for e in emisores_sample)}")
-            elif len(unique_fechas_vencimiento) > 1:
-                fechas_sample = sorted([f for f in unique_fechas_vencimiento if f])[:2]
-                if fechas_sample:
-                    fechas_str = ", ".join(f.strftime("%d/%m/%Y") for f in fechas_sample)
-                    questions.append(f"¿Cuál es la fecha de vencimiento? Por ejemplo: {fechas_str}")
         
         return questions
 

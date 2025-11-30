@@ -378,7 +378,7 @@ function formatData(data) {
             keys.forEach(key => {
                 if (!excludedKeys.includes(key)) {
                     const value = item[key];
-                    const formatted = formatValue(value);
+                    const formatted = formatValue(value, key);
                     const className = typeof value === 'number' ? 'number' : '';
                     html += `<td class="${className}">${formatted}</td>`;
                 }
@@ -402,7 +402,7 @@ function formatKey(key) {
         'fecha': 'Fecha',
         'precio_limpio': 'Precio Limpio',
         'precio_sucio': 'Precio Sucio',
-        'tasa': 'Tasa',
+        'tasa': 'TIR',
         'duracion': 'Duración',
         'convexidad': 'Convexidad',
         'emisor': 'Emisor',
@@ -411,8 +411,27 @@ function formatKey(key) {
     return keyMap[key] || key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
 }
 
-function formatValue(value) {
+function formatValue(value, key = null) {
     if (value === null || value === undefined) return 'N/A';
+    
+    // Para TIR (tasa), preservar todos los decimales tal como vienen de la base de datos
+    if (key === 'tasa') {
+        if (typeof value === 'number') {
+            // Usar toFixed con 6 decimales para preservar precisión completa
+            // Esto evitará redondeo y preservará todos los decimales significativos
+            let formatted = value.toFixed(6);
+            // Eliminar ceros finales innecesarios, pero preservar los decimales significativos
+            formatted = formatted.replace(/\.?0+$/, '');
+            // Si quedó sin decimales, agregar .000
+            if (!formatted.includes('.')) {
+                formatted = formatted + '.000';
+            }
+            return formatted;
+        }
+        // Si viene como string, devolverlo tal cual
+        return String(value);
+    }
+    
     if (typeof value === 'number') {
         if (value % 1 === 0) return value.toFixed(0);
         return value.toFixed(2);

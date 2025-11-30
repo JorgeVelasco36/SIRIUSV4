@@ -22,6 +22,8 @@ from services.chat_service import ChatService
 from services.query_service import QueryService
 from services.ingestion_service import IngestionService
 from config import settings
+from typing import Dict
+import threading
 
 # Configurar logging
 logging.basicConfig(
@@ -32,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 # Crear tablas si no existen
 Base.metadata.create_all(bind=engine)
+
+# Almacenamiento de contexto de conversación por usuario/sesión
+# Clave: user_id o session_id, Valor: dict con last_query, last_results, last_query_params
+conversation_contexts: Dict[str, Dict] = {}
+context_lock = threading.Lock()  # Lock para acceso thread-safe
 
 # Inicializar FastAPI
 app = FastAPI(
@@ -145,10 +152,28 @@ async def chat(
     - "Trae valoración de ayer para estos 5 ISINs."
     """
     try:
+        # Identificar usuario/sesión para mantener contexto
+        user_id = message.user or "default"
+        
+        # Obtener contexto previo de la conversación (thread-safe)
+        context = None
+        with context_lock:
+            context = conversation_contexts.get(user_id)
+        
         # Usar el token de acceso de Supabase si está disponible
         access_token = message.supabase_access_token
-        chat_service = ChatService(db, supabase_access_token=access_token)
+        chat_service = ChatService(
+            db, 
+            supabase_access_token=access_token,
+            conversation_context=context
+        )
         response = chat_service.generate_response(message.message, message.user)
+        
+        # Guardar nuevo contexto después de procesar la consulta (thread-safe)
+        new_context = chat_service.get_conversation_context()
+        with context_lock:
+            conversation_contexts[user_id] = new_context
+        
         return ChatResponse(**response)
     except Exception as e:
         logger.error(f"Error en endpoint /chat: {str(e)}")

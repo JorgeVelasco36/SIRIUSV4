@@ -302,14 +302,36 @@ class QueryService:
                         params[f"{fecha_col}"] = f"eq.{query.fecha.isoformat()}"
                     
                     # Agregar filtro de fecha de vencimiento si existe
-                    # NOTA: No aplicamos el filtro directamente en la consulta PostgREST porque puede ser muy estricto
-                    # En su lugar, aplicaremos el filtro después de obtener los datos para ser más flexible
+                    # ESTRATEGIA HÍBRIDA: Aplicar filtro en Supabase con tolerancia, luego validar en Python
                     fecha_vencimiento_para_filtrar = None
                     if query.fecha_vencimiento:
-                        logger.info(f"Fecha de vencimiento especificada: {query.fecha_vencimiento.isoformat()}, se filtrará después de obtener los datos")
+                        # Buscar columna de fecha de vencimiento
+                        vencimiento_col = None
+                        for col in ["VENCIMIENTO", "vencimiento", "FECHA_VENCIMIENTO", "fecha_vencimiento", "VENCIMIENTO_FECHA"]:
+                            if col in available_columns:
+                                vencimiento_col = col
+                                break
+                        
+                        if vencimiento_col:
+                            # Aplicar filtro en Supabase con tolerancia de ±1 día para manejar variaciones de formato
+                            fecha_iso = query.fecha_vencimiento.isoformat()
+                            # Usar rango en Supabase: desde 1 día antes hasta 1 día después
+                            from datetime import timedelta
+                            fecha_min = (query.fecha_vencimiento - timedelta(days=1)).isoformat()
+                            fecha_max = (query.fecha_vencimiento + timedelta(days=1)).isoformat()
+                            # PostgREST: usar gte y lte para rango (parámetros separados)
+                            # httpx maneja automáticamente múltiples valores para la misma clave
+                            params[f"{vencimiento_col}"] = [f"gte.{fecha_min}", f"lte.{fecha_max}"]
+                            logger.info(f"Filtro de fecha de vencimiento en Supabase: {fecha_min} a {fecha_max} (tolerancia ±1 día)")
+                        else:
+                            logger.warning(f"No se encontró columna de fecha de vencimiento. Columnas disponibles: {available_columns}")
+                        
+                        # Guardar para validación final en Python (coincidencia exacta)
                         fecha_vencimiento_para_filtrar = query.fecha_vencimiento
+                        logger.info(f"Fecha de vencimiento también se validará en Python con coincidencia exacta: {query.fecha_vencimiento.isoformat()}")
                     
                     # Agregar filtro de cupón/tasa facial si existe
+                    # ESTRATEGIA HÍBRIDA: Aplicar filtro en Supabase con rango, luego validar en Python
                     if query.cupon is not None:
                         cupon_col = None
                         for col in ["TASA_FACIAL", "tasa_facial", "cupon", "CUPON", "TASA", "tasa"]:
@@ -318,21 +340,49 @@ class QueryService:
                                 break
                         
                         if cupon_col:
-                            # PostgREST: para rangos, usar sintaxis: col=gte.X&col=lte.Y
-                            # Pero httpx maneja esto automáticamente si pasamos una lista
-                            # Alternativa: usar and() en PostgREST
-                            # Por ahora, filtrar después de obtener los datos (más simple)
-                            # Guardar el valor para filtrar después
-                            logger.info(f"Filtrando por cupón/tasa facial: {query.cupon} (rango: {query.cupon - 0.01} - {query.cupon + 0.01})")
-                            # Nota: El filtrado se hará después de obtener los datos de Supabase
+                            # Aplicar filtro en Supabase con rango ampliado (tolerancia 0.02 para capturar variaciones)
+                            cupon_min = query.cupon - 0.02  # Rango ampliado para Supabase
+                            cupon_max = query.cupon + 0.02
+                            # PostgREST: usar gte y lte para rango numérico (parámetros separados)
+                            # httpx maneja automáticamente múltiples valores para la misma clave
+                            params[f"{cupon_col}"] = [f"gte.{cupon_min}", f"lte.{cupon_max}"]
+                            logger.info(f"Filtro de cupón/tasa facial en Supabase: {cupon_min} a {cupon_max} (rango ampliado ±0.02)")
+                            logger.info(f"Cupón también se validará en Python con rango exacto: {query.cupon - 0.01} a {query.cupon + 0.01}")
+                        else:
+                            logger.warning(f"No se encontró columna de cupón/tasa facial. Columnas disponibles: {available_columns}")
                     
                     # Pasar solo el nombre de la tabla, _make_request construye la URL
-                    # IMPORTANTE: Obtener TODOS los registros usando paginación
+                    # OPTIMIZACIÓN: Ajustar paginación según cantidad de filtros aplicados
                     logger.info(f"Consultando {table_name} con parámetros iniciales: {params}")
                     all_records = []
                     offset = 0
-                    limit_per_page = 1000  # Usar un límite más conservador para evitar problemas con Supabase
-                    max_iterations = 50  # Prevenir loops infinitos
+                    
+                    # Calcular cantidad de filtros aplicados (además del nemotécnico/ISIN)
+                    filtros_aplicados = 0
+                    if query.fecha:
+                        filtros_aplicados += 1
+                    if query.fecha_vencimiento:
+                        filtros_aplicados += 1
+                    if query.cupon is not None:
+                        filtros_aplicados += 1
+                    
+                    # OPTIMIZACIÓN: Si hay múltiples filtros, reducir paginación (esperamos menos resultados)
+                    if filtros_aplicados >= 2:
+                        # Con 2+ filtros, esperamos resultados muy específicos
+                        limit_per_page = 2000  # Límite más alto por página
+                        max_iterations = 5  # Máximo 10,000 registros (5 × 2000)
+                        logger.info(f"🔍 Múltiples filtros detectados ({filtros_aplicados}). Paginación optimizada: {limit_per_page} por página, máximo {max_iterations} iteraciones")
+                    elif filtros_aplicados == 1:
+                        # Con 1 filtro adicional, reducir moderadamente
+                        limit_per_page = 2000
+                        max_iterations = 10  # Máximo 20,000 registros
+                        logger.info(f"🔍 Un filtro adicional detectado. Paginación moderada: {limit_per_page} por página, máximo {max_iterations} iteraciones")
+                    else:
+                        # Sin filtros adicionales, usar paginación estándar
+                        limit_per_page = 1000  # Usar un límite más conservador para evitar problemas con Supabase
+                        max_iterations = 50  # Prevenir loops infinitos
+                        logger.info(f"📊 Sin filtros adicionales. Paginación estándar: {limit_per_page} por página, máximo {max_iterations} iteraciones")
+                    
                     iteration = 0
                     
                     try:
@@ -358,6 +408,12 @@ class QueryService:
                                 
                                 all_records.extend(response)
                                 logger.info(f"✅ Obtenidos {len(response)} registros en página {iteration + 1} (total acumulado: {len(all_records)})")
+                                
+                                # OPTIMIZACIÓN: Si hay múltiples filtros y ya tenemos suficientes registros, detener paginación temprano
+                                # Con filtros aplicados, si tenemos más de 5,000 registros, probablemente ya tenemos todos los relevantes
+                                if filtros_aplicados >= 2 and len(all_records) >= 5000:
+                                    logger.info(f"🎯 Deteniendo paginación temprano: {len(all_records)} registros obtenidos con {filtros_aplicados} filtros (suficiente para filtrado en Python)")
+                                    break
                                 
                                 # Si obtuvimos menos registros que el límite, significa que ya obtuvimos todos
                                 if len(response) < limit_per_page:
@@ -434,7 +490,8 @@ class QueryService:
                                     break
                             
                             if cupon_col:
-                                cupon_min = query.cupon - 0.01
+                                # VALIDACIÓN FINAL: Rango exacto en Python (más estricto que Supabase)
+                                cupon_min = query.cupon - 0.01  # Rango exacto para validación final
                                 cupon_max = query.cupon + 0.01
                                 # Convertir a numérico si es necesario
                                 df_normalized[cupon_col] = pd.to_numeric(df_normalized[cupon_col], errors='coerce')
@@ -442,7 +499,7 @@ class QueryService:
                                 registros_antes = len(df_normalized)
                                 df_normalized = df_normalized[mask]
                                 registros_despues = len(df_normalized)
-                                logger.info(f"Filtrado por cupón {query.cupon} (rango: {cupon_min} - {cupon_max}): {registros_antes} → {registros_despues} registros")
+                                logger.info(f"✅ Validación final en Python: cupón {query.cupon} (rango exacto: {cupon_min} - {cupon_max}): {registros_antes} → {registros_despues} registros")
                             else:
                                 logger.warning(f"No se encontró columna de cupón para filtrar. Columnas disponibles: {list(df_normalized.columns)}")
                         
@@ -551,9 +608,9 @@ class QueryService:
                                     elif hasattr(fecha_v, 'date'):
                                         fecha_v = fecha_v.date()
                                     
-                                    # IMPORTANTE: Coincidencia exacta cuando el usuario especifica fecha exacta
-                                    # La tolerancia de 1 día solo se usaba para casos de parsing/redondeo,
-                                    # pero cuando el usuario busca una fecha específica, debe ser exacta
+                                    # VALIDACIÓN FINAL: Coincidencia exacta en Python (más estricta que el filtro de Supabase)
+                                    # El filtro de Supabase usa tolerancia ±1 día para capturar variaciones de formato
+                                    # Aquí validamos coincidencia exacta para garantizar precisión
                                     if fecha_v == fecha_vencimiento_buscada:
                                         valuations_filtradas.append(v)
                                         if es_isin_faltante:

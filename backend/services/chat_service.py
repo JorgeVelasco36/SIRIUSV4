@@ -292,13 +292,15 @@ class ChatService:
         if contiene_tasa_facial or contiene_cupon:
             logger.info("Mensaje contiene 'tasa facial' o 'cupón', evitando interpretar como nemotécnico")
         
-        # Intentar extraer ISIN (formato CO seguido de 10 caracteres alfanuméricos)
-        # Ejemplos: CO000123456, COB07CD0PY71, COT12345678
-        # Patrón mejorado: CO seguido de 10 caracteres alfanuméricos
-        isin_pattern = r'\bCO[A-Z0-9]{10}\b'
+        # Intentar extraer ISIN (formato CO seguido de 10-12 caracteres alfanuméricos)
+        # Ejemplos: CO000123456, COB07CD0PY71, COT12345678, COB52CD08C68
+        # Patrón mejorado: CO seguido de 10-12 caracteres alfanuméricos (para capturar ISINs de 12-14 caracteres totales)
+        isin_pattern = r'\bCO[A-Z0-9]{10,12}\b'
         isins = re.findall(isin_pattern, message_upper)
         if isins:
-            result["isins"] = isins
+            # Normalizar ISINs: strip y upper
+            isins_normalized = [isin.strip().upper() for isin in isins]
+            result["isins"] = isins_normalized
             result["_search_type"] = "isin"
         else:
             # Buscar nemotécnicos o códigos cortos (ej: CDTCLPS5V)
@@ -547,6 +549,9 @@ class ChatService:
             elif isins_detectados:
                 # Búsqueda por ISIN
                 isins_list = isins_detectados
+                # Normalizar ISINs: strip y upper
+                isins_list = [isin.strip().upper() if isin else None for isin in isins_list]
+                isins_list = [isin for isin in isins_list if isin]  # Eliminar None
                 if len(isins_list) > 1:
                     isins = isins_list
                 elif len(isins_list) == 1:

@@ -2,7 +2,7 @@
 Servicio de consultas estructuradas a la base de datos
 """
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from typing import List, Optional, Dict
 from datetime import date, datetime
 from models import Valuation, Provider
@@ -35,9 +35,11 @@ class QueryService:
         """
         query_builder = self.db.query(Valuation)
         
-        # Filtro por ISIN
+        # Filtro por ISIN (case-insensitive)
         if query.isin:
-            query_builder = query_builder.filter(Valuation.isin == query.isin)
+            isin_normalized = query.isin.strip().upper() if query.isin else None
+            if isin_normalized:
+                query_builder = query_builder.filter(func.upper(Valuation.isin) == isin_normalized)
         
         # Filtro por múltiples ISINs
         if query.isins:
@@ -214,7 +216,11 @@ class QueryService:
                     search_params = {}
                     
                     if query.isin:
-                        # Búsqueda por ISIN
+                        # Búsqueda por ISIN (case-insensitive)
+                        isin_normalized = query.isin.strip().upper() if query.isin else None
+                        if not isin_normalized:
+                            continue
+                        
                         isin_col = None
                         for col in ["ISIN", "isin", "ISIN_CODIGO", "codigo_isin"]:
                             if col in available_columns:
@@ -222,7 +228,10 @@ class QueryService:
                                 break
                         
                         if isin_col:
-                            search_params[f"{isin_col}"] = f"eq.{query.isin}"
+                            # Estrategia: Usar eq. con ISIN normalizado (funciona perfectamente según diagnóstico)
+                            # El ISIN está en Supabase, solo necesitamos normalizarlo correctamente
+                            search_params[f"{isin_col}"] = f"eq.{isin_normalized}"
+                            logger.info(f"🔍 Buscando ISIN '{isin_normalized}' en columna '{isin_col}' usando eq. (búsqueda exacta)")
                         else:
                             continue
                     elif query.emisor and query.tipo_instrumento and query.emisor == query.tipo_instrumento:
@@ -277,7 +286,10 @@ class QueryService:
                     }
                     params.update(search_params)
                     
-                    logger.info(f"Buscando nemotécnico '{nemotecnico}' en {table_name} - obteniendo hasta 5000 registros iniciales")
+                    if query.isin:
+                        logger.info(f"Buscando ISIN '{isin_normalized}' en {table_name} usando filtro eq. en Supabase")
+                    else:
+                        logger.info(f"Buscando nemotécnico '{nemotecnico}' en {table_name} - obteniendo hasta 5000 registros iniciales")
                     
                     # Agregar filtro de fecha de valoración si existe
                     fecha_col = None
@@ -370,7 +382,10 @@ class QueryService:
                         df = pd.DataFrame(all_records)
                         logger.info(f"DataFrame creado con {len(df)} filas y {len(df.columns)} columnas")
                     else:
-                        logger.warning(f"⚠️ No se obtuvieron registros de {table_name} para nemotécnico '{nemotecnico}'")
+                        if query.isin:
+                            logger.warning(f"⚠️ No se obtuvieron registros de {table_name} para ISIN '{query.isin}'")
+                        else:
+                            logger.warning(f"⚠️ No se obtuvieron registros de {table_name} para nemotécnico '{nemotecnico}'")
                         df = pd.DataFrame()
                     
                     # Continuar procesando solo si hay datos en el DataFrame
@@ -459,6 +474,21 @@ class QueryService:
                         )
                         
                         logger.info(f"Se procesaron {len(valuations)} valoraciones de {provider.value} antes de aplicar filtros adicionales")
+                        
+                        # Filtrar por ISIN exacto si se especificó (después de normalizar, para asegurar coincidencia exacta)
+                        if query.isin and valuations:
+                            isin_normalized = query.isin.strip().upper() if query.isin else None
+                            if isin_normalized:
+                                resultados_antes_isin = len(valuations)
+                                valuations = [
+                                    v for v in valuations 
+                                    if v.isin and str(v.isin).strip().upper() == isin_normalized
+                                ]
+                                resultados_despues_isin = len(valuations)
+                                if resultados_antes_isin != resultados_despues_isin:
+                                    logger.info(f"Filtrado por ISIN exacto '{isin_normalized}': {resultados_antes_isin} → {resultados_despues_isin} valoraciones")
+                                else:
+                                    logger.debug(f"ISIN '{isin_normalized}' ya estaba filtrado correctamente: {resultados_despues_isin} valoraciones")
                         
                         # Log adicional: mostrar algunos ISINs únicos encontrados para debugging
                         if valuations:

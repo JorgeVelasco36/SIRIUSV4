@@ -85,6 +85,13 @@ class ChatService:
         from models import Provider
         from datetime import datetime
         
+        # Normalizar cupón al deserializar (por si viene con formato incorrecto del contexto)
+        cupon = query_dict.get("cupon")
+        if cupon is not None:
+            cupon = self.normalize_cupon(cupon)
+            if cupon is None:
+                logger.warning(f"⚠️ No se pudo normalizar cupón '{query_dict.get('cupon')}' al deserializar, se usará None")
+        
         return ValuationQuery(
             isin=query_dict.get("isin"),
             isins=query_dict.get("isins"),
@@ -95,7 +102,7 @@ class ChatService:
             emisor=query_dict.get("emisor"),
             tipo_instrumento=query_dict.get("tipo_instrumento"),
             fecha_vencimiento=datetime.fromisoformat(query_dict["fecha_vencimiento"]).date() if query_dict.get("fecha_vencimiento") else None,
-            cupon=query_dict.get("cupon")
+            cupon=cupon
         )
     
     def _serialize_results(self, results: Optional[List]) -> Optional[List[Dict]]:
@@ -152,9 +159,11 @@ class ChatService:
         4. Proveedor: "PIP_LATAM" o "PRECIA" o ambos o null si no se especifica
         5. Fecha: fecha específica o "hoy", "ayer", etc.
         6. Fecha de vencimiento: si menciona "vencimiento al DD/MM/YYYY" o "vencimiento al DD-MM-YYYY"
-        7. Tasa facial/Cupón: si menciona "tasa facial", "cupón", "tasa del X%", "cupón del X%" → extraer el valor numérico
+        7. Tasa facial/Cupón: si menciona "tasa facial", "cupón", "tasa del X%", "cupón del X%" → extraer SOLO el valor numérico (sin símbolo %)
+           - IMPORTANTE: El valor debe ser solo el número, sin el símbolo % ni espacios
            - Ejemplo: "tasa facial es del 8.8501" → cupon: 8.8501
-           - Ejemplo: "cupón del 9.5%" → cupon: 9.5
+           - Ejemplo: "cupón del 9.5%" → cupon: 9.5 (sin el %)
+           - Ejemplo: "tasa facial del 14,2232%" → cupon: 14.2232 (sin el %, coma convertida a punto)
         8. Campos específicos solicitados: 
            - Si menciona "TIR", "tasa", "yield", "rendimiento" → incluir "tasa"
            - Si menciona "precio limpio" → incluir "precio_limpio"
@@ -331,6 +340,44 @@ class ChatService:
         
         return result
     
+    def normalize_cupon(self, cupon_value) -> Optional[float]:
+        """
+        Normaliza el valor del cupón/tasa facial al formato de la base de datos.
+        
+        Protocolo de normalización:
+        1. Si es string, elimina el símbolo % si está presente
+        2. Reemplaza comas por puntos para conversión a float
+        3. Convierte a float
+        4. Retorna None si no se puede convertir
+        
+        Args:
+            cupon_value: Valor del cupón (puede ser string con %, float, int, etc.)
+        
+        Returns:
+            float normalizado o None si no se puede convertir
+        """
+        if cupon_value is None:
+            return None
+        
+        try:
+            # Si es string, normalizar
+            if isinstance(cupon_value, str):
+                # Eliminar espacios y símbolo %
+                cupon_str = cupon_value.strip().replace('%', '').replace(' ', '')
+                # Reemplazar coma por punto para conversión a float
+                cupon_str = cupon_str.replace(',', '.')
+                # Convertir a float
+                return float(cupon_str)
+            # Si ya es numérico, retornar directamente
+            elif isinstance(cupon_value, (int, float)):
+                return float(cupon_value)
+            else:
+                logger.warning(f"Tipo de cupón no reconocido: {type(cupon_value)}, valor: {cupon_value}")
+                return None
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Error normalizando cupón '{cupon_value}': {str(e)}")
+            return None
+    
     def parse_date(self, date_str: Optional[str]) -> Optional[date]:
         """Parsea string de fecha a objeto date"""
         if not date_str:
@@ -390,23 +437,21 @@ class ChatService:
                 match = re.search(pattern, message_original)  # Buscar en mensaje original para mantener formato
                 if match:
                     try:
-                        # Normalizar: reemplazar coma por punto para conversión a float
-                        cupon_str = match.group(1).replace(',', '.')
-                        cupon_val = float(cupon_str)
-                        cupon = cupon_val
-                        logger.info(f"Tasa facial/Cupón detectado: {cupon} (de patrón: {pattern})")
-                        break
+                        # Usar función de normalización para convertir al formato de la BD
+                        cupon_str = match.group(1)
+                        cupon = self.normalize_cupon(cupon_str)
+                        if cupon is not None:
+                            logger.info(f"Tasa facial/Cupón detectado y normalizado: {cupon} (de patrón: {pattern}, valor original: '{cupon_str}')")
+                            break
                     except Exception as e:
                         logger.debug(f"Error parseando cupón de '{match.group(1)}': {str(e)}")
                         continue
         
-        # Si el LLM extrajo cupon, usarlo
+        # Si el LLM extrajo cupon, usarlo (normalizar también)
         if not cupon and extracted.get("cupon"):
-            try:
-                cupon = float(extracted.get("cupon"))
-                logger.info(f"Tasa facial/Cupón del LLM: {cupon}")
-            except:
-                pass
+            cupon = self.normalize_cupon(extracted.get("cupon"))
+            if cupon is not None:
+                logger.info(f"Tasa facial/Cupón del LLM normalizado: {cupon} (valor original: '{extracted.get('cupon')}')")
         
         # Extraer fecha de vencimiento del mensaje si se menciona
         if "vencimiento" in message_lower or "vencen" in message_lower:
@@ -516,6 +561,19 @@ class ChatService:
         # IMPORTANTE: Si se detectó refinamiento y se extrajo cupón, asegurar que se asigne
         if mensaje_es_refinamiento and cupon is not None:
             logger.info(f"🔧 Asignando cupón {cupon} al query de refinamiento")
+        
+        # Normalizar cupón final antes de construir el query (por si viene de alguna otra fuente)
+        if cupon is not None:
+            cupon_normalizado = self.normalize_cupon(cupon)
+            if cupon_normalizado is not None:
+                cupon = cupon_normalizado
+                logger.info(f"✅ Cupón normalizado final antes de construir query: {cupon}")
+            else:
+                logger.warning(f"⚠️ No se pudo normalizar cupón '{cupon}', se usará None")
+                cupon = None
+        
+        # Asegurar que Provider esté disponible (ya está importado al inicio, pero por seguridad)
+        # Provider está importado al inicio del archivo: from models import Provider
         
         query_result = ValuationQuery(
             isin=isin,
@@ -706,7 +764,13 @@ class ChatService:
                                 if fecha_vencimiento_val != self.last_query.fecha_vencimiento:
                                     match = False
                             if self.last_query.cupon is not None and cupon_val is not None:
-                                if abs(cupon_val - self.last_query.cupon) > 0.01:
+                                # Normalizar ambos valores antes de comparar
+                                cupon_val_normalizado = self.normalize_cupon(cupon_val)
+                                cupon_query_normalizado = self.normalize_cupon(self.last_query.cupon)
+                                if cupon_val_normalizado is not None and cupon_query_normalizado is not None:
+                                    if abs(cupon_val_normalizado - cupon_query_normalizado) > 0.01:
+                                        match = False
+                                elif cupon_val_normalizado != cupon_query_normalizado:
                                     match = False
                             if match:
                                 resultados_filtrados.append(v)
@@ -822,6 +886,16 @@ class ChatService:
                 logger.info(f"   Tiene cupón/tasa: {tiene_cupon_o_tasa}, cupón={query.cupon}")
                 logger.info(f"   Características adicionales: {tiene_caracteristicas_adicionales}")
                 
+                # Log de verificación: verificar que los resultados tengan cupón disponible
+                if self.last_results:
+                    cupones_disponibles = []
+                    for v in self.last_results[:5]:  # Revisar primeros 5
+                        cupon_val = self._get_valuation_field(v, "cupon")
+                        isin_val = self._get_valuation_field(v, "isin")
+                        tipo_resultado = "dict" if isinstance(v, dict) else "object"
+                        cupones_disponibles.append(f"ISIN={isin_val}, cupon={cupon_val}, tipo={tipo_resultado}")
+                    logger.info(f"   📊 Verificación: Cupones en primeros resultados: {cupones_disponibles}")
+                
                 # IMPORTANTE: Guardar los resultados originales ANTES de filtrar
                 # Esto permite mostrar cuántos títulos había antes del filtro
                 resultados_originales_antes_filtro = []
@@ -833,28 +907,40 @@ class ChatService:
                 
                 # Filtrar last_results por cupón si se especificó
                 if query.cupon is not None:
-                    cupon_min = query.cupon - 0.01
-                    cupon_max = query.cupon + 0.01
+                    # Asegurar que query.cupon esté normalizado
+                    query_cupon_normalizado = self.normalize_cupon(query.cupon)
+                    if query_cupon_normalizado is None:
+                        logger.warning(f"⚠️ No se pudo normalizar cupón del query: {query.cupon}")
+                        query_cupon_normalizado = query.cupon  # Usar valor original como fallback
+                    else:
+                        logger.info(f"✅ Cupón del query normalizado: {query.cupon} → {query_cupon_normalizado}")
+                    
+                    cupon_min = query_cupon_normalizado - 0.01
+                    cupon_max = query_cupon_normalizado + 0.01
                     resultados_filtrados = []
-                    logger.info(f"🔍 Buscando cupón entre {cupon_min:.6f} y {cupon_max:.6f} (valor buscado: {query.cupon:.6f})")
+                    logger.info(f"🔍 Buscando cupón entre {cupon_min:.6f} y {cupon_max:.6f} (valor buscado: {query_cupon_normalizado:.6f})")
                     
                     # Log de cupones en last_results para debugging
                     cupones_encontrados = []
                     for v in self.last_results:
-                        cupon_val = self._get_valuation_field(v, "cupon")
+                        cupon_val_raw = self._get_valuation_field(v, "cupon")
                         isin_val = self._get_valuation_field(v, "isin")
+                        
+                        # Normalizar cupon_val antes de comparar (puede venir como string o con formato diferente)
+                        cupon_val = self.normalize_cupon(cupon_val_raw) if cupon_val_raw is not None else None
+                        
                         if cupon_val is not None:
-                            cupones_encontrados.append(f"ISIN={isin_val}, cupon={cupon_val:.6f}")
+                            cupones_encontrados.append(f"ISIN={isin_val}, cupon={cupon_val:.6f} (original: {cupon_val_raw})")
                         if cupon_val is not None and cupon_min <= cupon_val <= cupon_max:
                             resultados_filtrados.append(v)
                             logger.info(f"   ✅ ISIN {isin_val} pasó el filtro: cupon={cupon_val:.6f} está en rango [{cupon_min:.6f}, {cupon_max:.6f}]")
                         elif cupon_val is not None:
-                            logger.info(f"   ❌ ISIN {isin_val} NO pasó el filtro: cupon={cupon_val:.6f} está fuera del rango [{cupon_min:.6f}, {cupon_max:.6f}] (diferencia: {abs(cupon_val - query.cupon):.6f})")
+                            logger.info(f"   ❌ ISIN {isin_val} NO pasó el filtro: cupon={cupon_val:.6f} está fuera del rango [{cupon_min:.6f}, {cupon_max:.6f}] (diferencia: {abs(cupon_val - query_cupon_normalizado):.6f})")
                         else:
-                            logger.info(f"   ⚠️ ISIN {isin_val} no tiene cupón disponible")
+                            logger.info(f"   ⚠️ ISIN {isin_val} no tiene cupón disponible (valor original: {cupon_val_raw})")
                     
                     logger.info(f"📋 Cupones encontrados en last_results: {cupones_encontrados}")
-                    logger.info(f"✅ Filtrado por cupón {query.cupon}: {len(self.last_results)} → {len(resultados_filtrados)} resultados")
+                    logger.info(f"✅ Filtrado por cupón {query_cupon_normalizado}: {len(self.last_results)} → {len(resultados_filtrados)} resultados")
                     valuations = resultados_filtrados
                     
                     # IMPORTANTE: Guardar los resultados originales ANTES de actualizar last_results
@@ -864,9 +950,9 @@ class ChatService:
                     # Actualizar last_results con los resultados filtrados
                     self.last_results = valuations
                     
-                    # Actualizar last_query con el cupón agregado
+                    # Actualizar last_query con el cupón normalizado agregado
                     if self.last_query:
-                        self.last_query.cupon = query.cupon
+                        self.last_query.cupon = query_cupon_normalizado
                     
                     # Guardar información del refinamiento para usar después
                     refinamiento_con_cupon = True
@@ -1153,7 +1239,10 @@ class ChatService:
                 proveedor_encontrado = valuation_encontrada.proveedor if hasattr(valuation_encontrada, "proveedor") else self._get_valuation_field(valuation_encontrada, "proveedor")
                 
                 # Determinar el otro proveedor
-                otro_proveedor = Provider.PIP_LATAM if proveedor_encontrado == Provider.PRECIA else Provider.PRECIA
+                # IMPORTANTE: Provider está importado al inicio del archivo (línea 8: from models import Provider)
+                # Asegurar que esté disponible en este scope
+                from models import Provider  # Re-importar para asegurar disponibilidad en este scope
+                otro_proveedor = Provider.PIP_LATAM if (proveedor_encontrado == Provider.PRECIA or (isinstance(proveedor_encontrado, str) and "PRECIA" in str(proveedor_encontrado))) else Provider.PRECIA
                 
                 # IMPORTANTE: Si hay un ISIN y no se especificó un proveedor, buscar en el otro proveedor también
                 # Esto asegura que se muestren valoraciones de ambos proveedores cuando existen
@@ -1541,19 +1630,30 @@ class ChatService:
                     result["fecha"] = result["fecha"].isoformat()
                 else:
                     result["fecha"] = str(result["fecha"])
+            # Asegurar que fecha_vencimiento esté en formato correcto
+            if "fecha_vencimiento" in result and result["fecha_vencimiento"] and not isinstance(result["fecha_vencimiento"], str):
+                if hasattr(result["fecha_vencimiento"], "isoformat"):
+                    result["fecha_vencimiento"] = result["fecha_vencimiento"].isoformat()
+                else:
+                    result["fecha_vencimiento"] = str(result["fecha_vencimiento"])
             # Asegurar que proveedor esté en formato correcto
             if "proveedor" in result:
                 if isinstance(result["proveedor"], dict):
                     result["proveedor"] = result["proveedor"].get("value", str(result["proveedor"]))
                 elif hasattr(result["proveedor"], "value"):
                     result["proveedor"] = result["proveedor"].value
+            # IMPORTANTE: Asegurar que cupon esté como float (no string) si existe
+            if "cupon" in result and result["cupon"] is not None:
+                if isinstance(result["cupon"], str):
+                    # Normalizar cupón si viene como string
+                    result["cupon"] = self.normalize_cupon(result["cupon"])
             return result
         
         # Si es un objeto Valuation, convertirlo a diccionario
         # IMPORTANTE: Para tasa (TIR), preservar todos los decimales tal como están en la base
         # Enviar como número (no string) para que JavaScript pueda formatearlo correctamente
         # La precisión se preservará en la serialización JSON
-        return {
+        result = {
             "isin": valuation.isin,
             "emisor": valuation.emisor,
             "tipo_instrumento": valuation.tipo_instrumento,
@@ -1565,6 +1665,15 @@ class ChatService:
             "fecha": valuation.fecha.isoformat() if valuation.fecha else None,
             "proveedor": valuation.proveedor.value if hasattr(valuation.proveedor, "value") else str(valuation.proveedor)
         }
+        
+        # IMPORTANTE: Incluir campos adicionales necesarios para refinamiento (cupon, fecha_vencimiento, etc.)
+        # Estos campos son críticos para que el refinamiento funcione correctamente
+        if hasattr(valuation, "cupon") and valuation.cupon is not None:
+            result["cupon"] = valuation.cupon  # Mantener como float para preservar precisión
+        if hasattr(valuation, "fecha_vencimiento") and valuation.fecha_vencimiento:
+            result["fecha_vencimiento"] = valuation.fecha_vencimiento.isoformat() if hasattr(valuation.fecha_vencimiento, "isoformat") else str(valuation.fecha_vencimiento)
+        
+        return result
     
     def _generate_comparison_recommendations(self, comparison: Dict) -> List[str]:
         """Genera recomendaciones basadas en comparación"""
@@ -1844,12 +1953,20 @@ class ChatService:
     
     def _filter_by_cupon(self, valuations: List, cupon: float) -> List:
         """Filtra valoraciones por cupón/tasa facial con tolerancia de 0.01%"""
-        cupon_min = cupon - 0.01
-        cupon_max = cupon + 0.01
+        # Normalizar el cupón de búsqueda antes de comparar
+        cupon_normalizado = self.normalize_cupon(cupon)
+        if cupon_normalizado is None:
+            logger.warning(f"⚠️ No se pudo normalizar cupón en _filter_by_cupon: {cupon}, usando valor original")
+            cupon_normalizado = cupon
+        
+        cupon_min = cupon_normalizado - 0.01
+        cupon_max = cupon_normalizado + 0.01
         resultados_filtrados = []
         
         for v in valuations:
-            cupon_val = self._get_valuation_field(v, "cupon")
+            cupon_val_raw = self._get_valuation_field(v, "cupon")
+            # Normalizar cupon_val antes de comparar (puede venir como string o con formato diferente)
+            cupon_val = self.normalize_cupon(cupon_val_raw) if cupon_val_raw is not None else None
             if cupon_val is not None and cupon_min <= cupon_val <= cupon_max:
                 resultados_filtrados.append(v)
         
